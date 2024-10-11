@@ -1,6 +1,4 @@
-### Edge Prompt Tuning for Graph Neural Networks
-
-#### Introduction
+## Introduction
 This is our implementation of our paper *Edge Prompt Tuning for Graph Neural Networks*.
 
 **TL;DR**: A graph prompt tuning method from the perspective of edges.
@@ -17,7 +15,7 @@ We provide comprehensive theoretical analyses of our method regarding its capabi
 Extensive experiments on ten graph datasets under four pre-training strategies demonstrate the superiority of our proposed method against six baselines.
 
 
-#### Dependencies
+## Dependencies
 torch==2.1.1  
 torch-geometric==2.5.1  
 torch-cluster==1.6.3  
@@ -26,7 +24,7 @@ torch-scatter==2.1.2
 ogb==1.3.6 
 
 
-#### Usage
+## Usage
 ##### 1. Install dependencies
 ```
 conda create --name EdgePrompt -y python=3.9.18
