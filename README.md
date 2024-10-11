@@ -16,12 +16,13 @@ Extensive experiments on ten graph datasets under four pre-training strategies d
 
 
 ## Dependencies
-torch==2.1.1  
-torch-geometric==2.5.1  
-torch-cluster==1.6.3  
-torch-sparse==0.6.18   
-torch-scatter==2.1.2  
-ogb==1.3.6 
+- numpy==1.26.1
+- torch==2.1.1  
+- torch-geometric==2.5.1  
+- torch-cluster==1.6.3  
+- torch-sparse==0.6.18   
+- torch-scatter==2.1.2  
+- ogb==1.3.6 
 
 
 ## Usage
@@ -30,7 +31,7 @@ ogb==1.3.6
 conda create --name EdgePrompt -y python=3.9.18
 conda activate EdgePrompt
 pip install torch==2.1.1 --index-url https://download.pytorch.org/whl/cu118
-pip install torch-geometric==2.5.1 ogb==1.3.6
+pip install numpy==1.26.1 torch-geometric==2.5.1 ogb==1.3.6
 pip install torch-cluster==1.6.3 torch-sparse==0.6.18 torch-scatter==2.1.2 -f https://data.pyg.org/whl/torch-2.1.1+cu118.html
 ```
 ##### 2. Run code
@@ -47,17 +48,16 @@ python downstream_task.py
 
 ## Parameters
 
-| Parameter         |           Description             | 
-|-------------------|-----------------------------------|
-| dataset_name      |   Dataset to use                  |
-| shots             |   Number of shots                 |
-| gnn_type          |   GNN type                        |
-| num_layer         |   GNN layers                      |
-| hidden_dim        |   hidden_dim                      |
-| gpu_id            |   GPU device ID                   |
-| pretrain_task     |   pretrain task                   |
-| prompt_type       |   Prompt methods                  |
-| num_prompts       |   Number of prompts               |
-| batch_size        |   batch size for training         |
-| epochs            |   epochs                          |
-
+| Parameter         |           Description                       | 
+|-------------------|---------------------------------------------|
+| dataset_name      |   Dataset to use                            |
+| shots             |   Number of shots                           |
+| gnn_type          |   GNN type                                  |
+| num_layer         |   GNN layers                                |
+| hidden_dim        |   hidden_dim (default: 128)                 |
+| gpu_id            |   GPU device ID (default: 0)                |
+| pretrain_task     |   pretrain task (default: GraphCL)          |
+| prompt_type       |   Prompt methods (default: EdgePromptplus)  |
+| num_prompts       |   Number of prompts                         |
+| batch_size        |   batch size for training (default: 32)     |
+| epochs            |   epochs (default: 200)                     |
