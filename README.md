@@ -1,5 +1,5 @@
 ## Introduction
-This is our implementation of our paper *Edge Prompt Tuning for Graph Neural Networks*.
+This is our implementation of our paper *Edge Prompt Tuning for Graph Neural Networks* accepted by ICLR 2025.
 
 **TL;DR**: A graph prompt tuning method from the perspective of edges.
 
