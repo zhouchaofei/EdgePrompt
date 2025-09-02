@@ -52,19 +52,71 @@ class GIN(nn.Module):
 
         h_list = [x]
 
-        for layer in range(self.num_layer):
-            edge_prompt = False
-            if prompt_type in ['EdgePrompt', 'EdgePromptplus']:
-                edge_prompt = prompt.get_prompt(x, edge_index, layer=layer)
-            x = self.convs[layer](h_list[layer], edge_index, edge_prompt)
-            x = self.batch_norms[layer](x)
+        # Handle different prompt types
+        if prompt_type == 'NodeEdgePrompt':
+            # Serial fusion: apply node prompt to input
+            x = prompt.get_node_prompt(x)
+            h_list[0] = x
 
-            if layer == self.num_layer - 1:
-                x = F.dropout(x, self.drop_ratio, training=self.training)
-            else:
-                x = F.dropout(F.relu(x), self.drop_ratio, training=self.training)
+            # Apply edge prompts at each layer
+            for layer in range(self.num_layer):
+                edge_prompt = prompt.get_edge_prompt(h_list[layer], edge_index, layer)
+                x = self.convs[layer](h_list[layer], edge_index, edge_prompt)
+                x = self.batch_norms[layer](x)
 
-            h_list.append(x)
+                if layer == self.num_layer - 1:
+                    x = F.dropout(x, self.drop_ratio, training=self.training)
+                else:
+                    x = F.dropout(F.relu(x), self.drop_ratio, training=self.training)
+
+                h_list.append(x)
+
+        elif prompt_type == 'ParallelNodeEdgePrompt':
+            # Parallel fusion: apply both prompts at each layer
+            for layer in range(self.num_layer):
+                node_prompt, edge_prompt, weights = prompt.get_prompts(h_list[layer], edge_index, layer)
+
+                # Apply node prompt
+                x_with_node = h_list[layer]
+                if node_prompt is not None:
+                    x_with_node = h_list[layer] + node_prompt
+
+                # Forward with edge prompt
+                x = self.convs[layer](x_with_node, edge_index, edge_prompt)
+                x = self.batch_norms[layer](x)
+
+                if layer == self.num_layer - 1:
+                    x = F.dropout(x, self.drop_ratio, training=self.training)
+                else:
+                    x = F.dropout(F.relu(x), self.drop_ratio, training=self.training)
+
+                h_list.append(x)
+
+        elif prompt_type in ['EdgePrompt', 'EdgePromptplus']:
+            # Original edge-only prompt
+            for layer in range(self.num_layer):
+                edge_prompt = prompt.get_prompt(h_list[layer], edge_index, layer)
+                x = self.convs[layer](h_list[layer], edge_index, edge_prompt)
+                x = self.batch_norms[layer](x)
+
+                if layer == self.num_layer - 1:
+                    x = F.dropout(x, self.drop_ratio, training=self.training)
+                else:
+                    x = F.dropout(F.relu(x), self.drop_ratio, training=self.training)
+
+                h_list.append(x)
+        else:
+            # No prompt
+            for layer in range(self.num_layer):
+                x = self.convs[layer](h_list[layer], edge_index, False)
+                x = self.batch_norms[layer](x)
+
+                if layer == self.num_layer - 1:
+                    x = F.dropout(x, self.drop_ratio, training=self.training)
+                else:
+                    x = F.dropout(F.relu(x), self.drop_ratio, training=self.training)
+
+                h_list.append(x)
 
         node_emb = h_list[-1]
         if pooling == 'mean':
@@ -72,4 +124,3 @@ class GIN(nn.Module):
             return graph_emb
 
         return node_emb
-
