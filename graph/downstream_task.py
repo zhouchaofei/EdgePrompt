@@ -11,14 +11,15 @@ from sklearn import metrics
 
 from load_data import GraphDownstream, load_graph_data
 from model import GIN
-from prompt import EdgePrompt, EdgePromptplus, NodeEdgePrompt, ParallelNodeEdgePrompt
+from prompt import (EdgePrompt, EdgePromptplus, SerialNodeEdgePrompt,
+                    ParallelNodeEdgePrompt, InteractiveNodeEdgePrompt)
 from logger import Logger
 
 
 class GraphTask():
     def __init__(self, dataset_name, shots, gnn_type, num_layer, hidden_dim, device,
-                 pretrain_task, prompt_type, num_prompts, logger, node_prompt_type=None,
-                 node_num_prompts=5, fusion_type='serial'):
+                 pretrain_task, prompt_type, num_prompts, logger,
+                 node_prompt_type=None, node_num_prompts=5, fusion_method='weighted'):
         self.dataset_name = dataset_name
         self.gnn_type = gnn_type
         self.num_layer = num_layer
@@ -29,7 +30,7 @@ class GraphTask():
         self.num_prompts = num_prompts
         self.node_prompt_type = node_prompt_type
         self.node_num_prompts = node_num_prompts
-        self.fusion_type = fusion_type
+        self.fusion_method = fusion_method
         self.logger = logger
 
         if dataset_name in ['ENZYMES', 'DD', 'NCI1', 'NCI109', 'Mutagenicity']:
@@ -54,18 +55,15 @@ class GraphTask():
 
         print(self.gnn)
         self.gnn.to(self.device)
-
         self.classifier = nn.Linear(self.hidden_dim, self.output_dim).to(self.device)
 
     def initialize_prompt(self):
         dim_list = [self.input_dim] + [self.hidden_dim] * (self.num_layer - 1)
 
-        # Check if we're using fusion prompts
-        if self.prompt_type == 'NodeEdgePrompt':
-            # Serial fusion
+        if self.prompt_type == 'SerialNodeEdgePrompt':
             edge_type = 'EdgePrompt' if self.num_prompts == 1 else 'EdgePromptplus'
             node_type = self.node_prompt_type if self.node_prompt_type else 'NodePrompt'
-            self.prompt = NodeEdgePrompt(
+            self.prompt = SerialNodeEdgePrompt(
                 dim_list=dim_list,
                 edge_type=edge_type,
                 node_type=node_type,
@@ -74,10 +72,21 @@ class GraphTask():
             ).to(self.device)
 
         elif self.prompt_type == 'ParallelNodeEdgePrompt':
-            # Parallel fusion
             edge_type = 'EdgePrompt' if self.num_prompts == 1 else 'EdgePromptplus'
             node_type = self.node_prompt_type if self.node_prompt_type else 'NodePrompt'
             self.prompt = ParallelNodeEdgePrompt(
+                dim_list=dim_list,
+                edge_type=edge_type,
+                node_type=node_type,
+                edge_num_anchors=self.num_prompts,
+                node_num_anchors=self.node_num_prompts,
+                fusion_method=self.fusion_method
+            ).to(self.device)
+
+        elif self.prompt_type == 'InteractiveNodeEdgePrompt':
+            edge_type = 'EdgePrompt' if self.num_prompts == 1 else 'EdgePromptplus'
+            node_type = self.node_prompt_type if self.node_prompt_type else 'NodePrompt'
+            self.prompt = InteractiveNodeEdgePrompt(
                 dim_list=dim_list,
                 edge_type=edge_type,
                 node_type=node_type,
@@ -97,7 +106,11 @@ class GraphTask():
     def train(self, batch_size, lr=0.001, decay=0, epochs=100):
         train_loader = DataLoader(self.train_data, batch_size=batch_size, shuffle=True)
         test_loader = DataLoader(self.test_data, batch_size=batch_size, shuffle=False)
-        learnable_parameters = list(self.classifier.parameters()) + list(self.prompt.parameters())
+
+        learnable_parameters = list(self.classifier.parameters())
+        if self.prompt is not None:
+            learnable_parameters += list(self.prompt.parameters())
+
         optimizer = torch.optim.Adam(learnable_parameters, lr=lr, weight_decay=decay)
 
         best_test_accuracy = 0
@@ -115,7 +128,7 @@ class GraphTask():
                 total_loss.append(loss.item())
             train_loss = np.mean(total_loss)
 
-            if epoch % 1 == 0:
+            if epoch % 10 == 0:
                 self.gnn.eval()
                 pred_list = []
                 label_list = []
@@ -166,7 +179,7 @@ def run(args, seed):
         args.dataset_name, args.shots, args.gnn_type, args.num_layer, args.hidden_dim, device,
         args.pretrain_task, args.prompt_type, args.num_prompts, logger,
         node_prompt_type=args.node_prompt_type, node_num_prompts=args.node_num_prompts,
-        fusion_type=args.fusion_type
+        fusion_method=args.fusion_method
     )
 
     best_acc = task.train(args.batch_size, epochs=args.epochs)
@@ -174,40 +187,48 @@ def run(args, seed):
 
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description='Downstream task: graph classification with prompt fusion')
+    parser = argparse.ArgumentParser(description='Node-Edge Prompt Fusion for Graph Classification')
+
+    # 基础参数
     parser.add_argument('--dataset_name', type=str, default='NCI1', help='dataset name')
     parser.add_argument('--shots', type=int, default=50, help='number of shots (default: 50)')
     parser.add_argument('--gnn_type', type=str, default='GIN', help='gnn type')
     parser.add_argument('--num_layer', type=int, default=5, help='GNN layers (default: 5)')
     parser.add_argument('--hidden_dim', type=int, default=128, help='hidden_dim (default: 128)')
-    parser.add_argument('--gpu_id', type=int, default=0, help='GPU device ID (default: 0)')
+    parser.add_argument('--gpu_id', type=int, default=3, help='GPU device ID (default: 0)')
     parser.add_argument('--pretrain_task', type=str, default='GraphCL', help='pretrain task')
 
-    # Prompt-related arguments
-    parser.add_argument('--prompt_type', type=str, default='NodeEdgePrompt',
-                        help='Prompt methods: EdgePrompt, EdgePromptplus, NodeEdgePrompt, ParallelNodeEdgePrompt')
-    parser.add_argument('--num_prompts', type=int, default=5, help='num_prompts for edge prompt (default: 5)')
+    # 提示相关参数
+    parser.add_argument('--prompt_type', type=str, default='SerialNodeEdgePrompt',
+                        choices=['EdgePrompt', 'EdgePromptplus', 'SerialNodeEdgePrompt',
+                                 'ParallelNodeEdgePrompt', 'InteractiveNodeEdgePrompt'],
+                        help='Prompt fusion methods')
+    parser.add_argument('--num_prompts', type=int, default=5, help='edge prompt anchors (default: 5)')
     parser.add_argument('--node_prompt_type', type=str, default='NodePrompt',
-                        help='Node prompt type: NodePrompt or NodePromptplus')
-    parser.add_argument('--node_num_prompts', type=int, default=5, help='num_prompts for node prompt (default: 5)')
-    parser.add_argument('--fusion_type', type=str, default='serial',
-                        help='Fusion type: serial or parallel')
+                        choices=['NodePrompt', 'NodePromptplus'],
+                        help='Node prompt type')
+    parser.add_argument('--node_num_prompts', type=int, default=5, help='node prompt anchors (default: 5)')
+    parser.add_argument('--fusion_method', type=str, default='weighted',
+                        choices=['weighted', 'gated'],
+                        help='Fusion method for parallel strategy')
 
-    parser.add_argument('--batch_size', type=int, default=32, help='batch size for training (default: 32)')
-    parser.add_argument('--epochs', type=int, default=200, help='epochs (default: 200)')
+    # 训练参数
+    parser.add_argument('--batch_size', type=int, default=256, help='batch size (default: 256)')
+    parser.add_argument('--epochs', type=int, default=400, help='epochs (default: 400)')
+
     args = parser.parse_args()
 
-    # Run experiments with multiple seeds
+    # 运行实验
     all_results = []
     for seed in range(5):
         acc = run(args, seed)
         all_results.append(acc)
         print(f"Seed {seed}: Best Test Accuracy = {acc:.4f}")
 
-    print(f"\nFinal Results:")
+    print(f"\nFinal Results for {args.prompt_type}:")
     print(f"Mean Accuracy: {np.mean(all_results):.4f} ± {np.std(all_results):.4f}")
 
-    # Save results
+    # 保存结果
     with open(f'results_{args.prompt_type}.txt', 'a') as f:
         f.write(f"{args.dataset_name} {args.shots} {args.pretrain_task} {args.prompt_type}: ")
         f.write(f"{np.mean(all_results):.4f} ± {np.std(all_results):.4f}\n")

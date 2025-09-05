@@ -7,11 +7,12 @@ from torch_geometric.nn import MessagePassing, global_add_pool, global_mean_pool
 class GINConv(MessagePassing):
     def __init__(self, input_dim, hidden_dim):
         super(GINConv, self).__init__(aggr="add")
-
-        self.mlp = nn.Sequential(nn.Linear(input_dim, hidden_dim),
-                                 nn.BatchNorm1d(hidden_dim),
-                                 nn.ReLU(),
-                                 nn.Linear(hidden_dim, hidden_dim))
+        self.mlp = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.BatchNorm1d(hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim)
+        )
         self.eps = nn.Parameter(torch.Tensor([0]))
 
     def forward(self, x, edge_index, edge_prompt=False):
@@ -49,16 +50,15 @@ class GIN(nn.Module):
 
     def forward(self, data, prompt_type=None, prompt=False, pooling=False):
         x, edge_index, batch = data.x, data.edge_index, data.batch
-
         h_list = [x]
 
-        # Handle different prompt types
-        if prompt_type == 'NodeEdgePrompt':
-            # Serial fusion: apply node prompt to input
+        # 方案一：串行融合
+        if prompt_type == 'SerialNodeEdgePrompt':
+            # 首先对输入应用节点提示
             x = prompt.get_node_prompt(x)
             h_list[0] = x
 
-            # Apply edge prompts at each layer
+            # 然后在每层应用边提示
             for layer in range(self.num_layer):
                 edge_prompt = prompt.get_edge_prompt(h_list[layer], edge_index, layer)
                 x = self.convs[layer](h_list[layer], edge_index, edge_prompt)
@@ -71,18 +71,11 @@ class GIN(nn.Module):
 
                 h_list.append(x)
 
+        # 方案二：并行融合
         elif prompt_type == 'ParallelNodeEdgePrompt':
-            # Parallel fusion: apply both prompts at each layer
             for layer in range(self.num_layer):
-                node_prompt, edge_prompt, weights = prompt.get_prompts(h_list[layer], edge_index, layer)
-
-                # Apply node prompt
-                x_with_node = h_list[layer]
-                if node_prompt is not None:
-                    x_with_node = h_list[layer] + node_prompt
-
-                # Forward with edge prompt
-                x = self.convs[layer](x_with_node, edge_index, edge_prompt)
+                node_prompted_x, edge_prompt = prompt.get_prompts(h_list[layer], edge_index, layer)
+                x = self.convs[layer](node_prompted_x, edge_index, edge_prompt)
                 x = self.batch_norms[layer](x)
 
                 if layer == self.num_layer - 1:
@@ -92,8 +85,22 @@ class GIN(nn.Module):
 
                 h_list.append(x)
 
+        # 方案三：交互融合
+        elif prompt_type == 'InteractiveNodeEdgePrompt':
+            for layer in range(self.num_layer):
+                interactive_x, edge_prompt = prompt.get_interactive_prompts(h_list[layer], edge_index, layer)
+                x = self.convs[layer](interactive_x, edge_index, edge_prompt)
+                x = self.batch_norms[layer](x)
+
+                if layer == self.num_layer - 1:
+                    x = F.dropout(x, self.drop_ratio, training=self.training)
+                else:
+                    x = F.dropout(F.relu(x), self.drop_ratio, training=self.training)
+
+                h_list.append(x)
+
+        # 原有的边提示方法
         elif prompt_type in ['EdgePrompt', 'EdgePromptplus']:
-            # Original edge-only prompt
             for layer in range(self.num_layer):
                 edge_prompt = prompt.get_prompt(h_list[layer], edge_index, layer)
                 x = self.convs[layer](h_list[layer], edge_index, edge_prompt)
@@ -105,8 +112,9 @@ class GIN(nn.Module):
                     x = F.dropout(F.relu(x), self.drop_ratio, training=self.training)
 
                 h_list.append(x)
+
+        # 无提示
         else:
-            # No prompt
             for layer in range(self.num_layer):
                 x = self.convs[layer](h_list[layer], edge_index, False)
                 x = self.batch_norms[layer](x)
