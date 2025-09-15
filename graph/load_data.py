@@ -1,12 +1,14 @@
 """
-修改后的数据加载模块，支持ABIDE等脑成像数据集和原有的分子图数据集
+修改后的数据加载模块，支持ABIDE、MDD、ADHD200等脑成像数据集和原有的分子图数据集
 """
 import random
 import torch
 import os
 from torch_geometric.data import Data
-from torch_geometric.datasets import Planetoid, Flickr, TUDataset
-from abide_data import load_abide_data, ABIDEDataProcessor
+from torch_geometric.datasets import TUDataset
+from abide_data import load_abide_data
+from mdd_data import load_mdd_data
+from adhd_data import load_adhd_data
 
 
 def load_graph_data(dataset_name, data_folder):
@@ -29,12 +31,9 @@ def load_graph_data(dataset_name, data_folder):
         output_dim = dataset.num_classes
         return dataset, input_dim, output_dim
 
-    # 脑成像数据集
+    # ABIDE脑成像数据集
     elif dataset_name.startswith('ABIDE'):
         # 支持不同的图构建方法
-        # ABIDE_corr: 相关矩阵方法
-        # ABIDE_dynamic: 动态连接性方法
-        # ABIDE_phase: 相位同步方法
         if dataset_name == 'ABIDE' or dataset_name == 'ABIDE_corr':
             graph_method = 'correlation_matrix'
         elif dataset_name == 'ABIDE_dynamic':
@@ -50,21 +49,49 @@ def load_graph_data(dataset_name, data_folder):
         )
         return graph_list, input_dim, output_dim
 
-    # 未来支持的其他脑成像数据集
-    elif dataset_name == 'MDD':
-        # MDD数据集处理（待实现）
-        raise NotImplementedError(f'MDD数据集支持即将推出')
+    # MDD脑成像数据集
+    elif dataset_name.startswith('MDD'):
+        # 支持不同的图构建方法
+        if dataset_name == 'MDD' or dataset_name == 'MDD_corr':
+            graph_method = 'correlation_matrix'
+        elif dataset_name == 'MDD_dynamic':
+            graph_method = 'dynamic_connectivity'
+        elif dataset_name == 'MDD_phase':
+            graph_method = 'phase_synchronization'
+        else:
+            graph_method = 'correlation_matrix'
 
-    elif dataset_name == 'ADHD':
-        # ADHD数据集处理（待实现）
-        raise NotImplementedError(f'ADHD数据集支持即将推出')
+        graph_list, input_dim, output_dim = load_mdd_data(
+            data_folder=data_folder,
+            graph_method=graph_method
+        )
+        return graph_list, input_dim, output_dim
+
+    # ADHD200脑成像数据集
+    elif dataset_name.startswith('ADHD'):
+        # 支持不同的图构建方法
+        if dataset_name == 'ADHD' or dataset_name == 'ADHD_corr':
+            graph_method = 'correlation_matrix'
+        elif dataset_name == 'ADHD_dynamic':
+            graph_method = 'dynamic_connectivity'
+        elif dataset_name == 'ADHD_phase':
+            graph_method = 'phase_synchronization'
+        else:
+            graph_method = 'correlation_matrix'
+
+        graph_list, input_dim, output_dim = load_adhd_data(
+            data_folder=data_folder,
+            graph_method=graph_method
+        )
+        return graph_list, input_dim, output_dim
 
     else:
         raise ValueError(
             f'错误：无效的数据集名称！\n'
             f'支持的分子图数据集: [ENZYMES, DD, NCI1, NCI109, Mutagenicity]\n'
-            f'支持的脑成像数据集: [ABIDE, ABIDE_corr, ABIDE_dynamic, ABIDE_phase]\n'
-            f'即将支持: [MDD, ADHD]'
+            f'支持的脑成像数据集: [ABIDE, ABIDE_corr, ABIDE_dynamic, ABIDE_phase, '
+            f'MDD, MDD_corr, MDD_dynamic, MDD_phase, '
+            f'ADHD, ADHD_corr, ADHD_dynamic, ADHD_phase]\n'
         )
 
 
@@ -83,7 +110,7 @@ def GraphDownstream(data, shots=5, test_fraction=0.4):
     """
     # 检查数据类型
     if isinstance(data, list):
-        # 处理列表形式的数据（如ABIDE）
+        # 处理列表形式的数据（如ABIDE, MDD, ADHD）
         return GraphDownstreamFromList(data, shots, test_fraction)
     else:
         # 处理TUDataset形式的数据（原有数据集）
@@ -180,6 +207,32 @@ def get_dataset_info(dataset_name):
         info['task'] = '自闭症谱系障碍分类'
         info['classes'] = 2
         info['description'] = 'ABIDE I 数据集，包含控制组和ASD患者的静息态fMRI数据'
+
+        if 'dynamic' in dataset_name:
+            info['graph_method'] = '动态连接性'
+        elif 'phase' in dataset_name:
+            info['graph_method'] = '相位同步'
+        else:
+            info['graph_method'] = '相关矩阵'
+
+    elif dataset_name.startswith('MDD'):
+        info['type'] = '脑成像数据'
+        info['task'] = '抑郁症分类'
+        info['classes'] = 2
+        info['description'] = 'REST-meta-MDD数据集，包含抑郁症患者和健康对照的静息态fMRI数据'
+
+        if 'dynamic' in dataset_name:
+            info['graph_method'] = '动态连接性'
+        elif 'phase' in dataset_name:
+            info['graph_method'] = '相位同步'
+        else:
+            info['graph_method'] = '相关矩阵'
+
+    elif dataset_name.startswith('ADHD'):
+        info['type'] = '脑成像数据'
+        info['task'] = '注意力缺陷多动障碍分类'
+        info['classes'] = 2
+        info['description'] = 'ADHD-200数据集，包含ADHD患者和健康对照的静息态fMRI数据'
 
         if 'dynamic' in dataset_name:
             info['graph_method'] = '动态连接性'

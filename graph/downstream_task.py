@@ -1,5 +1,5 @@
 """
-修改后的下游任务模块，支持脑成像数据集和分子图数据集
+修改后的下游任务模块，支持脑成像数据集（ABIDE, MDD, ADHD）和分子图数据集
 """
 import random
 import logging
@@ -53,9 +53,17 @@ class GraphTask():
             self.logger.info(f"任务: {dataset_info.get('task', '未知')}")
             self.logger.info(f"描述: {dataset_info.get('description', '无')}")
 
-        # 支持的所有数据集
-        supported_datasets = ['ENZYMES', 'DD', 'NCI1', 'NCI109', 'Mutagenicity',
-                              'ABIDE', 'ABIDE_corr', 'ABIDE_dynamic', 'ABIDE_phase']
+        # 支持的所有数据集（更新列表）
+        supported_datasets = [
+            # 分子图数据集
+            'ENZYMES', 'DD', 'NCI1', 'NCI109', 'Mutagenicity',
+            # ABIDE数据集
+            'ABIDE', 'ABIDE_corr', 'ABIDE_dynamic', 'ABIDE_phase',
+            # MDD数据集
+            'MDD', 'MDD_corr', 'MDD_dynamic', 'MDD_phase',
+            # ADHD数据集
+            'ADHD', 'ADHD_corr', 'ADHD_dynamic', 'ADHD_phase'
+        ]
 
         if self.dataset_name in supported_datasets:
             self.graph_list, self.input_dim, self.output_dim = load_graph_data(
@@ -63,11 +71,27 @@ class GraphTask():
             )
 
             # 特殊处理脑成像数据集
-            if self.dataset_name.startswith('ABIDE'):
+            if self.dataset_name.startswith(('ABIDE', 'MDD', 'ADHD')):
                 # 对于脑成像数据，可能需要调整shots参数
-                if self.shots > 100:
-                    self.logger.warning(f"ABIDE数据集样本有限，将shots从{self.shots}调整为50")
-                    self.shots = min(self.shots, 50)
+                max_shots_per_class = 50  # 默认最大值
+
+                # 根据不同数据集调整
+                if self.dataset_name.startswith('MDD'):
+                    max_shots_per_class = 30  # MDD数据可能较少
+                elif self.dataset_name.startswith('ADHD'):
+                    max_shots_per_class = 40  # ADHD数据中等
+
+                if self.shots > max_shots_per_class:
+                    self.logger.warning(
+                        f"{self.dataset_name}数据集样本有限，"
+                        f"将shots从{self.shots}调整为{max_shots_per_class}"
+                    )
+                    self.shots = min(self.shots, max_shots_per_class)
+
+                # 检查数据是否成功加载
+                if not self.graph_list or len(self.graph_list) == 0:
+                    self.logger.error(f"数据集 {self.dataset_name} 加载失败或为空")
+                    raise ValueError(f"无法加载数据集 {self.dataset_name}")
 
             # 划分训练和测试集
             self.train_data, self.test_data = GraphDownstream(
@@ -93,8 +117,10 @@ class GraphTask():
         # 加载预训练模型（如果有）
         if self.pretrain_task is not None:
             # 对于脑成像数据集，预训练模型路径可能不同
-            if self.dataset_name.startswith('ABIDE'):
-                pretrained_gnn_file = f'./pretrained_gnns/{self.dataset_name}_{self.pretrain_task}_{self.gnn_type}_{self.num_layer}.pth'
+            if self.dataset_name.startswith(('ABIDE', 'MDD', 'ADHD')):
+                # 提取基础数据集名称（去除后缀）
+                base_dataset = self.dataset_name.split('_')[0]
+                pretrained_gnn_file = f'./pretrained_gnns/{base_dataset}_{self.pretrain_task}_{self.gnn_type}_{self.num_layer}.pth'
             else:
                 pretrained_gnn_file = f'./pretrained_gnns/{self.dataset_name}_{self.pretrain_task}_{self.gnn_type}_{self.num_layer}.pth'
 
@@ -159,10 +185,11 @@ class GraphTask():
     def train(self, batch_size, lr=0.001, decay=0, epochs=100):
         """训练模型"""
         # 对于脑成像数据集，可能需要调整batch_size
-        if self.dataset_name.startswith('ABIDE'):
-            # ABIDE数据集通常图比较大，减小batch_size
-            batch_size = max(batch_size, 32)
-            self.logger.info(f"调整batch_size为: {batch_size}")
+        if self.dataset_name.startswith(('ABIDE', 'MDD', 'ADHD')):
+            # 脑成像数据集通常图比较大，使用较小的batch_size
+            if batch_size > 64:
+                batch_size = 32
+                self.logger.info(f"调整batch_size为: {batch_size}")
 
         train_loader = DataLoader(self.train_data, batch_size=batch_size, shuffle=True)
         test_loader = DataLoader(self.test_data, batch_size=batch_size, shuffle=False)
@@ -284,9 +311,12 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Node-Edge Prompt Fusion for Graph Classification')
 
     # 基础参数
-    parser.add_argument('--dataset_name', type=str, default='ABIDE',
-                        help='数据集名称 (ENZYMES, DD, NCI1, NCI109, Mutagenicity, ABIDE, ABIDE_dynamic, ABIDE_phase)')
-    parser.add_argument('--shots', type=int, default=50, help='每类样本数 (default: 50)')
+    parser.add_argument('--dataset_name', type=str, default='MDD',
+                        help='数据集名称 (支持: ENZYMES, DD, NCI1, NCI109, Mutagenicity, '
+                             'ABIDE, ABIDE_dynamic, ABIDE_phase, '
+                             'MDD, MDD_dynamic, MDD_phase, '
+                             'ADHD, ADHD_dynamic, ADHD_phase)')
+    parser.add_argument('--shots', type=int, default=30, help='每类样本数 (default: 30)')
     parser.add_argument('--gnn_type', type=str, default='GIN', help='GNN类型')
     parser.add_argument('--num_layer', type=int, default=5, help='GNN层数 (default: 5)')
     parser.add_argument('--hidden_dim', type=int, default=128, help='隐藏层维度 (default: 128)')
@@ -308,16 +338,25 @@ if __name__ == '__main__':
                         help='并行策略的融合方法')
 
     # 训练参数
-    parser.add_argument('--batch_size', type=int, default=256, help='批次大小 (default: 256)')
-    parser.add_argument('--epochs', type=int, default=400, help='训练轮数 (default: 400)')
+    parser.add_argument('--batch_size', type=int, default=32, help='批次大小 (default: 32)')
+    parser.add_argument('--epochs', type=int, default=200, help='训练轮数 (default: 200)')
 
     args = parser.parse_args()
+
+    # 打印实验配置
+    print("\n" + "="*60)
+    print("实验配置")
+    print("="*60)
+    for key, value in vars(args).items():
+        print(f"{key:20s}: {value}")
+    print("="*60 + "\n")
 
     # 运行实验
     all_results_acc = []
     all_results_f1 = []
 
     for seed in range(5):
+        print(f"\n运行 Seed {seed}...")
         acc, f1 = run(args, seed)
         all_results_acc.append(acc)
         all_results_f1.append(f1)
