@@ -120,13 +120,58 @@ class GraphTask():
             if self.dataset_name.startswith(('ABIDE', 'MDD', 'ADHD')):
                 # 提取基础数据集名称（去除后缀）
                 base_dataset = self.dataset_name.split('_')[0]
-                pretrained_gnn_file = f'./pretrained_gnns/{base_dataset}_{self.pretrain_task}_{self.gnn_type}_{self.num_layer}.pth'
+
+                # 根据预训练任务选择模型路径
+                if self.pretrain_task == 'GraphMAE':
+                    # GraphMAE跨疾病预训练模型
+                    # 例如：在MDD上训练用于ABIDE，或在ABIDE上训练用于MDD
+                    if base_dataset == 'ABIDE':
+                        pretrained_gnn_file = f'./pretrained_models/graphmae/graphmae_MDD_for_ABIDE_correlation_matrix.pth'
+                    elif base_dataset == 'MDD':
+                        pretrained_gnn_file = f'./pretrained_models/graphmae/graphmae_ABIDE_for_MDD_correlation_matrix.pth'
+                    else:
+                        pretrained_gnn_file = f'./pretrained_models/graphmae/{base_dataset}_graphmae.pth'
+
+                elif self.pretrain_task == 'EdgePrediction':
+                    # Edge Prediction跨疾病预训练模型
+                    if base_dataset == 'ABIDE':
+                        pretrained_gnn_file = f'./pretrained_models/edge_prediction/edge_prediction_MDD_for_ABIDE_correlation_matrix.pth'
+                    elif base_dataset == 'MDD':
+                        pretrained_gnn_file = f'./pretrained_models/edge_prediction/edge_prediction_ABIDE_for_MDD_correlation_matrix.pth'
+                    else:
+                        pretrained_gnn_file = f'./pretrained_models/edge_prediction/{base_dataset}_edge_prediction.pth'
+
+                else:
+                    # 其他预训练任务
+                    pretrained_gnn_file = f'./pretrained_gnns/{base_dataset}_{self.pretrain_task}_{self.gnn_type}_{self.num_layer}.pth'
             else:
                 pretrained_gnn_file = f'./pretrained_gnns/{self.dataset_name}_{self.pretrain_task}_{self.gnn_type}_{self.num_layer}.pth'
 
             if os.path.exists(pretrained_gnn_file):
-                self.gnn.load_state_dict(torch.load(pretrained_gnn_file))
-                self.logger.info(f"加载预训练模型: {pretrained_gnn_file}")
+                checkpoint = torch.load(pretrained_gnn_file, map_location=self.device)
+
+                # 根据不同的预训练模型格式加载权重
+                if 'model_state_dict' in checkpoint:
+                    # GraphMAE和EdgePrediction格式
+                    if self.pretrain_task == 'GraphMAE':
+                        # GraphMAE的encoder权重
+                        self.gnn.load_state_dict(checkpoint['model_state_dict'], strict=False)
+                        self.logger.info(f"加载GraphMAE预训练模型: {pretrained_gnn_file}")
+                    elif self.pretrain_task == 'EdgePrediction':
+                        # EdgePrediction的encoder权重
+                        # 需要从EdgePredictionModel中提取encoder部分
+                        encoder_state_dict = {}
+                        for k, v in checkpoint['model_state_dict'].items():
+                            if k.startswith('encoder.'):
+                                # 移除'encoder.'前缀
+                                new_k = k.replace('encoder.', '')
+                                encoder_state_dict[new_k] = v
+                        self.gnn.load_state_dict(encoder_state_dict, strict=False)
+                        self.logger.info(f"加载EdgePrediction预训练模型: {pretrained_gnn_file}")
+                else:
+                    # 原始格式
+                    self.gnn.load_state_dict(checkpoint)
+                    self.logger.info(f"加载预训练模型: {pretrained_gnn_file}")
             else:
                 self.logger.warning(f"预训练模型不存在: {pretrained_gnn_file}")
 
