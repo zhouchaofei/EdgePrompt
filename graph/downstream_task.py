@@ -15,7 +15,8 @@ from sklearn import metrics
 from load_data import GraphDownstream, load_graph_data, get_dataset_info
 from model import GIN
 from prompt import (EdgePrompt, EdgePromptplus, SerialNodeEdgePrompt,
-                    ParallelNodeEdgePrompt, InteractiveNodeEdgePrompt)
+                    ParallelNodeEdgePrompt, InteractiveNodeEdgePrompt, ComplementaryNodeEdgePrompt,
+                    ContrastiveNodeEdgePrompt, SpectralNodeEdgePrompt)
 from logger import Logger
 
 
@@ -217,6 +218,48 @@ class GraphTask():
                 node_num_anchors=self.node_num_prompts
             ).to(self.device)
 
+        # 方案四：互补学习融合
+        elif self.prompt_type == 'ComplementaryNodeEdgePrompt':
+            edge_type = 'EdgePrompt' if self.num_prompts == 1 else 'EdgePromptplus'
+            node_type = self.node_prompt_type if self.node_prompt_type else 'NodePrompt'
+            self.prompt = ComplementaryNodeEdgePrompt(
+                dim_list=dim_list,
+                edge_type=edge_type,
+                node_type=node_type,
+                edge_num_anchors=self.num_prompts,
+                node_num_anchors=self.node_num_prompts,
+                recon_weight=0.1,  # 可以从args传入
+                link_pred_weight=0.1  # 可以从args传入
+            ).to(self.device)
+
+        # 方案五：对比学习融合
+        elif self.prompt_type == 'ContrastiveNodeEdgePrompt':
+            edge_type = 'EdgePrompt' if self.num_prompts == 1 else 'EdgePromptplus'
+            node_type = self.node_prompt_type if self.node_prompt_type else 'NodePrompt'
+            self.prompt = ContrastiveNodeEdgePrompt(
+                dim_list=dim_list,
+                edge_type=edge_type,
+                node_type=node_type,
+                edge_num_anchors=self.num_prompts,
+                node_num_anchors=self.node_num_prompts,
+                temperature=0.5,  # 可以从args传入
+                contrast_weight=0.1  # 可以从args传入
+            ).to(self.device)
+
+        # 方案六：图频域融合
+        elif self.prompt_type == 'SpectralNodeEdgePrompt':
+            edge_type = 'EdgePrompt' if self.num_prompts == 1 else 'EdgePromptplus'
+            node_type = self.node_prompt_type if self.node_prompt_type else 'NodePrompt'
+            self.prompt = SpectralNodeEdgePrompt(
+                dim_list=dim_list,
+                edge_type=edge_type,
+                node_type=node_type,
+                edge_num_anchors=self.num_prompts,
+                node_num_anchors=self.node_num_prompts,
+                num_filters=8  # 可以从args传入
+            ).to(self.device)
+
+
         elif self.prompt_type == 'EdgePrompt':
             self.prompt = EdgePrompt(dim_list=dim_list).to(self.device)
 
@@ -248,21 +291,71 @@ class GraphTask():
         best_test_accuracy = 0
         best_test_f1 = 0
         patience_counter = 0
-        early_stop_patience = 20  # 早停耐心值
+        early_stop_patience = 20
 
         for epoch in range(1, 1 + epochs):
             # 训练阶段
             total_loss = []
+            total_aux_loss = []  # 新增：辅助损失
             self.gnn.train()
+
             for i, data in enumerate(train_loader):
                 data = data.to(self.device)
                 optimizer.zero_grad()
+
+                # 计算主任务损失
                 emb = self.gnn(data, self.prompt_type, self.prompt, pooling='mean')
                 out = self.classifier(emb)
-                loss = F.cross_entropy(out, data.y.squeeze())
+                main_loss = F.cross_entropy(out, data.y.squeeze())
+
+                # 计算辅助损失（如果是互补学习）
+                if self.prompt_type == 'ComplementaryNodeEdgePrompt':
+                    # 获取中间结果
+                    x = data.x
+                    h_list = [x]
+                    aux_loss_total = 0
+
+                    for layer in range(min(1, self.gnn.num_layer)):  # 只计算第一层的辅助损失
+                        final_x, edge_prompt, node_x, edge_x = \
+                            self.prompt.get_complementary_prompts(
+                                h_list[layer], data.edge_index, layer
+                            )
+                        aux_losses = self.prompt.compute_auxiliary_losses(
+                            h_list[layer], data.edge_index, layer, node_x, edge_x
+                        )
+                        if aux_losses:
+                            aux_loss_total += sum(aux_losses.values())
+
+                    loss = main_loss + aux_loss_total
+                    if aux_loss_total > 0:
+                        total_aux_loss.append(aux_loss_total.item())
+
+                # 计算对比损失（如果是对比学习）
+                elif self.prompt_type == 'ContrastiveNodeEdgePrompt':
+                    contrast_loss_total = 0
+                    x = data.x
+                    h_list = [x]
+
+                    for layer in range(min(1, self.gnn.num_layer)):  # 只计算第一层的对比损失
+                        final_x, edge_prompt, views = \
+                            self.prompt.get_contrastive_prompts(
+                                h_list[layer], data.edge_index, layer
+                            )
+                        contrast_loss = self.prompt.compute_contrastive_loss(
+                            views, layer, data.batch
+                        )
+                        contrast_loss_total += contrast_loss
+
+                    loss = main_loss + contrast_loss_total
+                    if contrast_loss_total > 0:
+                        total_aux_loss.append(contrast_loss_total.item())
+                else:
+                    loss = main_loss
+
                 loss.backward()
                 optimizer.step()
-                total_loss.append(loss.item())
+                total_loss.append(main_loss.item())
+
             train_loss = np.mean(total_loss)
 
             # 评估阶段
@@ -371,8 +464,24 @@ if __name__ == '__main__':
     # 提示相关参数
     parser.add_argument('--prompt_type', type=str, default='SerialNodeEdgePrompt',
                         choices=['EdgePrompt', 'EdgePromptplus', 'SerialNodeEdgePrompt',
-                                 'ParallelNodeEdgePrompt', 'InteractiveNodeEdgePrompt'],
+                                 'ParallelNodeEdgePrompt', 'InteractiveNodeEdgePrompt',
+                                 'ComplementaryNodeEdgePrompt', 'ContrastiveNodeEdgePrompt',
+                                 'SpectralNodeEdgePrompt'],
                         help='提示融合方法')
+
+    # 新增参数
+    parser.add_argument('--recon_weight', type=float, default=0.1,
+                        help='互补学习中重构损失权重')
+    parser.add_argument('--link_pred_weight', type=float, default=0.1,
+                        help='互补学习中链接预测损失权重')
+    parser.add_argument('--temperature', type=float, default=0.5,
+                        help='对比学习温度参数')
+    parser.add_argument('--contrast_weight', type=float, default=0.1,
+                        help='对比学习损失权重')
+    # 谱域融合参数
+    parser.add_argument('--num_filters', type=int, default=8,
+                        help='谱域融合的滤波器数量')
+
     parser.add_argument('--num_prompts', type=int, default=5, help='边提示锚点数 (default: 5)')
     parser.add_argument('--node_prompt_type', type=str, default='NodePrompt',
                         choices=['NodePrompt', 'NodePromptplus'],

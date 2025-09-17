@@ -99,6 +99,54 @@ class GIN(nn.Module):
 
                 h_list.append(x)
 
+        # 方案四：互补学习融合
+        elif prompt_type == 'ComplementaryNodeEdgePrompt':
+            for layer in range(self.num_layer):
+                final_x, edge_prompt, node_x, edge_x = prompt.get_complementary_prompts(
+                    h_list[layer], edge_index, layer
+                )
+                x = self.convs[layer](final_x, edge_index, edge_prompt)
+                x = self.batch_norms[layer](x)
+
+                if layer == self.num_layer - 1:
+                    x = F.dropout(x, self.drop_ratio, training=self.training)
+                else:
+                    x = F.dropout(F.relu(x), self.drop_ratio, training=self.training)
+
+                h_list.append(x)
+
+        # 方案五：对比学习融合
+        elif prompt_type == 'ContrastiveNodeEdgePrompt':
+            for layer in range(self.num_layer):
+                final_x, edge_prompt, views = prompt.get_contrastive_prompts(
+                    h_list[layer], edge_index, layer
+                )
+                x = self.convs[layer](final_x, edge_index, edge_prompt)
+                x = self.batch_norms[layer](x)
+
+                if layer == self.num_layer - 1:
+                    x = F.dropout(x, self.drop_ratio, training=self.training)
+                else:
+                    x = F.dropout(F.relu(x), self.drop_ratio, training=self.training)
+
+                h_list.append(x)
+
+        # 方案六：图频域融合
+        elif prompt_type == 'SpectralNodeEdgePrompt':
+            for layer in range(self.num_layer):
+                final_x, edge_prompt = prompt.get_spectral_prompts(
+                    h_list[layer], edge_index, layer
+                )
+                x = self.convs[layer](final_x, edge_index, edge_prompt)
+                x = self.batch_norms[layer](x)
+
+                if layer == self.num_layer - 1:
+                    x = F.dropout(x, self.drop_ratio, training=self.training)
+                else:
+                    x = F.dropout(F.relu(x), self.drop_ratio, training=self.training)
+
+                h_list.append(x)
+
         # 原有的边提示方法
         elif prompt_type in ['EdgePrompt', 'EdgePromptplus']:
             for layer in range(self.num_layer):
