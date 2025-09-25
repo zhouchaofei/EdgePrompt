@@ -659,3 +659,652 @@ class SpectralNodeEdgePrompt(nn.Module):
             final_x = final_node
 
         return final_x, edge_prompt
+
+
+class HierarchicalGraphTransformerPrompt(nn.Module):
+    """层次化图变换器融合"""
+
+    def __init__(self, dim_list, edge_type='EdgePromptplus', node_type='NodePromptplus',
+                 edge_num_anchors=5, node_num_anchors=5, num_heads=4, num_scales=3):
+        super().__init__()
+
+        # 基础提示
+        self.node_prompts = nn.ModuleList([
+            NodePromptplus(dim, node_num_anchors) if node_type == 'NodePromptplus'
+            else NodePrompt(dim) for dim in dim_list
+        ])
+
+        if edge_type == 'EdgePromptplus':
+            self.edge_prompt = EdgePromptplus(dim_list, edge_num_anchors)
+        else:
+            self.edge_prompt = EdgePrompt(dim_list)
+
+        # 多尺度变换器
+        self.transformers = nn.ModuleList()
+        for dim in dim_list:
+            scale_transformers = nn.ModuleList()
+            for scale in range(num_scales):
+                heads = min(num_heads * (2 ** scale), dim)
+                if dim % heads != 0:
+                    heads = 1
+                scale_transformers.append(
+                    nn.MultiheadAttention(dim, heads, batch_first=True)
+                )
+            self.transformers.append(scale_transformers)
+
+        self.scale_gates = nn.ModuleList([
+            nn.Linear(dim * num_scales, num_scales) for dim in dim_list
+        ])
+
+    def get_prompts(self, x, edge_index, layer):
+        """获取层次化提示"""
+        node_prompted_x = self.node_prompts[layer].add(x) if hasattr(self.node_prompts[layer], 'add') else x + \
+                                                                                                           self.node_prompts[
+                                                                                                               layer].global_prompt
+        edge_prompt = self.edge_prompt.get_prompt(x, edge_index, layer)
+
+        # 多尺度处理
+        scale_outputs = []
+        for transformer in self.transformers[layer]:
+            query = node_prompted_x.unsqueeze(0)
+            key = value = query
+            attended, _ = transformer(query, key, value)
+            scale_outputs.append(attended.squeeze(0))
+
+        # 自适应融合
+        if scale_outputs:
+            concat_feats = torch.cat(scale_outputs, dim=1)
+            scale_weights = F.softmax(self.scale_gates[layer](concat_feats), dim=1)
+
+            final_x = torch.zeros_like(x)
+            for i, output in enumerate(scale_outputs):
+                final_x += scale_weights[:, i:i + 1] * output
+        else:
+            final_x = node_prompted_x
+
+        return final_x, edge_prompt
+
+
+class GraphNeuralODEPrompt(nn.Module):
+    """图神经ODE融合"""
+
+    def __init__(self, dim_list, edge_type='EdgePromptplus', node_type='NodePromptplus',
+                 edge_num_anchors=5, node_num_anchors=5, ode_steps=5):
+        super().__init__()
+
+        self.node_prompts = nn.ModuleList([
+            NodePromptplus(dim, node_num_anchors) if node_type == 'NodePromptplus'
+            else NodePrompt(dim) for dim in dim_list
+        ])
+
+        if edge_type == 'EdgePromptplus':
+            self.edge_prompt = EdgePromptplus(dim_list, edge_num_anchors)
+        else:
+            self.edge_prompt = EdgePrompt(dim_list)
+
+        self.ode_funcs = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(dim * 2, dim),
+                nn.ReLU(),
+                nn.Linear(dim, dim)
+            ) for dim in dim_list
+        ])
+
+        self.ode_steps = ode_steps
+
+    def get_prompts(self, x, edge_index, layer):
+        """ODE演化提示"""
+        node_prompted_x = self.node_prompts[layer].add(x) if hasattr(self.node_prompts[layer], 'add') else x + \
+                                                                                                           self.node_prompts[
+                                                                                                               layer].global_prompt
+        edge_prompt = self.edge_prompt.get_prompt(x, edge_index, layer)
+
+        # 边聚合
+        edge_aggregated = torch.zeros_like(x)
+        if edge_prompt is not False and edge_prompt.size(0) == edge_index.size(1):
+            edge_aggregated.index_add_(0, edge_index[0], edge_prompt)
+            edge_aggregated.index_add_(0, edge_index[1], edge_prompt)
+
+        # ODE演化
+        dt = 1.0 / self.ode_steps
+        evolved_x = node_prompted_x
+        for _ in range(self.ode_steps):
+            combined = torch.cat([evolved_x, edge_aggregated], dim=1)
+            dx = self.ode_funcs[layer](combined)
+            evolved_x = evolved_x + dt * dx
+
+        return evolved_x, edge_prompt
+
+
+class MetaLearningPrompt(nn.Module):
+    """元学习自适应融合"""
+
+    def __init__(self, dim_list, edge_num_anchors=5, node_num_anchors=5):
+        super().__init__()
+
+        # 多种策略
+        self.strategies = nn.ModuleDict({
+            'serial': SerialNodeEdgePrompt(dim_list, 'EdgePromptplus', 'NodePromptplus',
+                                           edge_num_anchors, node_num_anchors),
+            'parallel': ParallelNodeEdgePrompt(dim_list, 'EdgePromptplus', 'NodePromptplus',
+                                               edge_num_anchors, node_num_anchors),
+            'interactive': InteractiveNodeEdgePrompt(dim_list, 'EdgePromptplus', 'NodePromptplus',
+                                                     edge_num_anchors, node_num_anchors)
+        })
+
+        self.meta_networks = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(dim * 2, dim),
+                nn.ReLU(),
+                nn.Linear(dim, len(self.strategies)),
+                nn.Softmax(dim=1)
+            ) for dim in dim_list
+        ])
+
+    def get_prompts(self, x, edge_index, layer):
+        """元学习选择策略"""
+        # 计算图特征
+        graph_feats = torch.cat([x.mean(dim=0, keepdim=True), x.std(dim=0, keepdim=True)], dim=1)
+        meta_input = graph_feats.expand(x.size(0), -1)
+
+        # 预测策略权重
+        strategy_weights = self.meta_networks[layer](meta_input)
+
+        # 执行所有策略
+        results = []
+        if 'serial' in self.strategies:
+            prompted_x = self.strategies['serial'].get_node_prompt(x)
+            edge_p = self.strategies['serial'].get_edge_prompt(prompted_x, edge_index, layer)
+            results.append((prompted_x, edge_p))
+
+        if 'parallel' in self.strategies:
+            results.append(self.strategies['parallel'].get_prompts(x, edge_index, layer))
+
+        if 'interactive' in self.strategies:
+            results.append(self.strategies['interactive'].get_interactive_prompts(x, edge_index, layer))
+
+        # 加权融合
+        final_x = torch.zeros_like(x)
+        final_edge = None
+        for i, (node_x, edge_p) in enumerate(results):
+            weight = strategy_weights[:, i:i + 1]
+            final_x += weight * node_x
+            if final_edge is None:
+                final_edge = edge_p
+
+        return final_x, final_edge
+
+
+class CausalGraphPrompt(nn.Module):
+    """因果推理融合"""
+
+    def __init__(self, dim_list, edge_type='EdgePromptplus', node_type='NodePromptplus',
+                 edge_num_anchors=5, node_num_anchors=5):
+        super().__init__()
+
+        self.node_prompts = nn.ModuleList([
+            NodePromptplus(dim, node_num_anchors) if node_type == 'NodePromptplus'
+            else NodePrompt(dim) for dim in dim_list
+        ])
+
+        if edge_type == 'EdgePromptplus':
+            self.edge_prompt = EdgePromptplus(dim_list, edge_num_anchors)
+        else:
+            self.edge_prompt = EdgePrompt(dim_list)
+
+        self.causal_discovery = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(dim * 2, dim),
+                nn.ReLU(),
+                nn.Linear(dim, dim),
+                nn.Sigmoid()
+            ) for dim in dim_list
+        ])
+
+        self.intervention = nn.ModuleList([
+            nn.Linear(dim, dim) for dim in dim_list
+        ])
+
+    def get_prompts(self, x, edge_index, layer):
+        """因果推理提示"""
+        node_prompted_x = self.node_prompts[layer].add(x) if hasattr(self.node_prompts[layer], 'add') else x + \
+                                                                                                           self.node_prompts[
+                                                                                                               layer].global_prompt
+        edge_prompt = self.edge_prompt.get_prompt(x, edge_index, layer)
+
+        # 边聚合
+        edge_aggregated = torch.zeros_like(x)
+        if edge_prompt is not False and edge_prompt.size(0) == edge_index.size(1):
+            edge_aggregated.index_add_(0, edge_index[0], edge_prompt)
+            edge_aggregated.index_add_(0, edge_index[1], edge_prompt)
+
+        # 因果强度
+        combined = torch.cat([node_prompted_x, edge_aggregated], dim=1)
+        causal_strength = self.causal_discovery[layer](combined)
+
+        # 因果干预
+        intervened = self.intervention[layer](node_prompted_x + edge_aggregated)
+
+        # 应用因果效应
+        final_x = node_prompted_x + causal_strength * intervened
+
+        return final_x, edge_prompt
+
+
+# ========== 新增融合方法 ==========
+
+class GraphWaveletPrompt(nn.Module):
+    """图小波变换融合 - 多尺度频域分析"""
+
+    def __init__(self, dim_list, edge_type='EdgePromptplus', node_type='NodePromptplus',
+                 edge_num_anchors=5, node_num_anchors=5, num_scales=4):
+        super().__init__()
+
+        # 复用已有的节点提示
+        self.node_type = node_type
+        if node_type == 'NodePromptplus':
+            self.node_prompts = nn.ModuleList([
+                NodePromptplus(dim, node_num_anchors) for dim in dim_list
+            ])
+        else:
+            self.node_prompts = nn.ModuleList([
+                NodePrompt(dim) for dim in dim_list
+            ])
+
+        # 复用已有的边提示
+        self.edge_type = edge_type
+        if edge_type == 'EdgePromptplus':
+            self.edge_prompt = EdgePromptplus(dim_list, edge_num_anchors)
+        else:
+            self.edge_prompt = EdgePrompt(dim_list)
+
+        # 小波变换的尺度参数
+        self.scales = nn.ParameterList([
+            nn.Parameter(torch.ones(num_scales)) for _ in dim_list
+        ])
+
+        # 小波系数融合网络
+        self.wavelet_fusion = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(dim * num_scales, dim * 2),
+                nn.ReLU(),
+                nn.Linear(dim * 2, dim)
+            ) for dim in dim_list
+        ])
+
+        self.num_scales = num_scales
+
+    def graph_wavelet_transform(self, x, edge_index, scales):
+        """简化的图小波变换"""
+        wavelets = []
+        for s in range(self.num_scales):
+            scale = scales[s]
+            filtered = x * scale
+            for _ in range(s + 1):
+                neighbor_sum = torch.zeros_like(filtered)
+                neighbor_sum.index_add_(0, edge_index[0], filtered[edge_index[1]])
+                neighbor_sum.index_add_(0, edge_index[1], filtered[edge_index[0]])
+                filtered = 0.5 * filtered + 0.5 * neighbor_sum / (edge_index.size(1) / x.size(0) + 1e-6)
+            wavelets.append(filtered)
+        return torch.cat(wavelets, dim=1)
+
+    def get_prompts(self, x, edge_index, layer):
+        """小波变换提示融合"""
+        # 使用已有的节点提示方法
+        if self.node_type == 'NodePromptplus':
+            node_prompted_x = self.node_prompts[layer].add(x)
+        else:
+            node_prompted_x = self.node_prompts[layer].add(x)
+
+        # 使用已有的边提示方法
+        edge_prompt = self.edge_prompt.get_prompt(x, edge_index, layer)
+
+        # 节点特征的小波变换
+        node_wavelets = self.graph_wavelet_transform(node_prompted_x, edge_index, self.scales[layer])
+
+        # 边特征聚合后的小波变换
+        edge_aggregated = torch.zeros_like(x)
+        if edge_prompt is not False and edge_prompt.size(0) == edge_index.size(1):
+            edge_aggregated.index_add_(0, edge_index[0], edge_prompt)
+            edge_aggregated.index_add_(0, edge_index[1], edge_prompt)
+
+        edge_wavelets = self.graph_wavelet_transform(edge_aggregated, edge_index, self.scales[layer])
+
+        # 融合小波系数
+        combined_wavelets = node_wavelets + edge_wavelets
+        final_x = self.wavelet_fusion[layer](combined_wavelets)
+
+        return final_x, edge_prompt
+
+
+class DiffusionPrompt(nn.Module):
+    """扩散模型融合 - 使用去噪过程融合节点边提示"""
+
+    def __init__(self, dim_list, edge_type='EdgePromptplus', node_type='NodePromptplus',
+                 edge_num_anchors=5, node_num_anchors=5, diffusion_steps=3):
+        super().__init__()
+
+        # 复用已有的节点和边提示
+        self.node_type = node_type
+        if node_type == 'NodePromptplus':
+            self.node_prompts = nn.ModuleList([
+                NodePromptplus(dim, node_num_anchors) for dim in dim_list
+            ])
+        else:
+            self.node_prompts = nn.ModuleList([
+                NodePrompt(dim) for dim in dim_list
+            ])
+
+        if edge_type == 'EdgePromptplus':
+            self.edge_prompt = EdgePromptplus(dim_list, edge_num_anchors)
+        else:
+            self.edge_prompt = EdgePrompt(dim_list)
+
+        # 扩散过程的时间嵌入
+        self.time_embeddings = nn.ModuleList([
+            nn.Embedding(diffusion_steps, dim) for dim in dim_list
+        ])
+
+        # 去噪网络
+        self.denoise_networks = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(dim * 3, dim * 2),
+                nn.ReLU(),
+                nn.Linear(dim * 2, dim),
+                nn.ReLU(),
+                nn.Linear(dim, dim)
+            ) for dim in dim_list
+        ])
+
+        self.diffusion_steps = diffusion_steps
+
+    def get_prompts(self, x, edge_index, layer):
+        """扩散去噪融合"""
+        node_prompted_x = self.node_prompts[layer].add(x)
+        edge_prompt = self.edge_prompt.get_prompt(x, edge_index, layer)
+
+        # 边聚合作为"噪声"
+        edge_noise = torch.zeros_like(x)
+        if edge_prompt is not False and edge_prompt.size(0) == edge_index.size(1):
+            edge_noise.index_add_(0, edge_index[0], edge_prompt)
+            edge_noise.index_add_(0, edge_index[1], edge_prompt)
+
+        # 前向扩散
+        noisy_x = node_prompted_x
+        for t in range(self.diffusion_steps):
+            noise_level = (t + 1) / self.diffusion_steps
+            noisy_x = noisy_x + noise_level * edge_noise
+
+        # 反向去噪
+        denoised_x = noisy_x
+        for t in reversed(range(self.diffusion_steps)):
+            time_emb = self.time_embeddings[layer](
+                torch.tensor([t], device=x.device)
+            ).expand(x.size(0), -1)
+            combined = torch.cat([denoised_x, edge_noise, time_emb], dim=1)
+            denoised_x = denoised_x - self.denoise_networks[layer](combined) / (self.diffusion_steps - t)
+
+        return denoised_x, edge_prompt
+
+
+class RLPrompt(nn.Module):
+    """强化学习融合 - 将融合视为序列决策过程"""
+
+    def __init__(self, dim_list, edge_type='EdgePromptplus', node_type='NodePromptplus',
+                 edge_num_anchors=5, node_num_anchors=5):
+        super().__init__()
+
+        # 复用已有的提示
+        if node_type == 'NodePromptplus':
+            self.node_prompts = nn.ModuleList([
+                NodePromptplus(dim, node_num_anchors) for dim in dim_list
+            ])
+        else:
+            self.node_prompts = nn.ModuleList([
+                NodePrompt(dim) for dim in dim_list
+            ])
+
+        if edge_type == 'EdgePromptplus':
+            self.edge_prompt = EdgePromptplus(dim_list, edge_num_anchors)
+        else:
+            self.edge_prompt = EdgePrompt(dim_list)
+
+        # 策略网络
+        self.policy_networks = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(dim * 2, dim),
+                nn.ReLU(),
+                nn.Linear(dim, 3)
+            ) for dim in dim_list
+        ])
+
+        # 价值网络
+        self.value_networks = nn.ModuleList([
+            nn.Linear(dim, 1) for dim in dim_list
+        ])
+
+    def get_prompts(self, x, edge_index, layer):
+        """RL策略选择融合"""
+        node_prompted_x = self.node_prompts[layer].add(x)
+        edge_prompt = self.edge_prompt.get_prompt(x, edge_index, layer)
+
+        # 边聚合
+        edge_aggregated = torch.zeros_like(x)
+        if edge_prompt is not False and edge_prompt.size(0) == edge_index.size(1):
+            edge_aggregated.index_add_(0, edge_index[0], edge_prompt)
+            edge_aggregated.index_add_(0, edge_index[1], edge_prompt)
+
+        # 状态表示
+        state = torch.cat([node_prompted_x, edge_aggregated], dim=1)
+
+        # 策略决策
+        action_logits = self.policy_networks[layer](state)
+        action_probs = F.softmax(action_logits, dim=1)
+
+        # 根据动作概率融合
+        options = [node_prompted_x, edge_aggregated, (node_prompted_x + edge_aggregated) / 2]
+        final_x = torch.zeros_like(x)
+
+        for i, option in enumerate(options):
+            final_x += action_probs[:, i:i + 1] * option
+
+        return final_x, edge_prompt
+
+
+class AttentionFlowPrompt(nn.Module):
+    """图注意力流融合 - 模拟注意力在图上的流动"""
+
+    def __init__(self, dim_list, edge_type='EdgePromptplus', node_type='NodePromptplus',
+                 edge_num_anchors=5, node_num_anchors=5, flow_steps=3):
+        super().__init__()
+
+        # 复用已有提示
+        if node_type == 'NodePromptplus':
+            self.node_prompts = nn.ModuleList([
+                NodePromptplus(dim, node_num_anchors) for dim in dim_list
+            ])
+        else:
+            self.node_prompts = nn.ModuleList([
+                NodePrompt(dim) for dim in dim_list
+            ])
+
+        if edge_type == 'EdgePromptplus':
+            self.edge_prompt = EdgePromptplus(dim_list, edge_num_anchors)
+        else:
+            self.edge_prompt = EdgePrompt(dim_list)
+
+        # 注意力流动网络
+        self.flow_networks = nn.ModuleList([
+            nn.ModuleList([
+                nn.Linear(dim * 2, dim) for _ in range(flow_steps)
+            ]) for dim in dim_list
+        ])
+
+        # 流动门控
+        self.flow_gates = nn.ModuleList([
+            nn.Linear(dim, dim) for dim in dim_list
+        ])
+
+        self.flow_steps = flow_steps
+
+    def get_prompts(self, x, edge_index, layer):
+        """注意力流融合"""
+        node_prompted_x = self.node_prompts[layer].add(x)
+        edge_prompt = self.edge_prompt.get_prompt(x, edge_index, layer)
+
+        # 初始化注意力流
+        attention_flow = node_prompted_x
+
+        # 边信息
+        edge_info = torch.zeros_like(x)
+        if edge_prompt is not False and edge_prompt.size(0) == edge_index.size(1):
+            edge_info.index_add_(0, edge_index[0], edge_prompt)
+            edge_info.index_add_(0, edge_index[1], edge_prompt)
+
+        # 注意力流动
+        for step in range(self.flow_steps):
+            neighbor_attention = torch.zeros_like(attention_flow)
+            neighbor_attention.index_add_(0, edge_index[0], attention_flow[edge_index[1]])
+
+            combined = torch.cat([attention_flow, neighbor_attention], dim=1)
+            flow_update = self.flow_networks[layer][step](combined)
+
+            gate = torch.sigmoid(self.flow_gates[layer](edge_info))
+            attention_flow = gate * flow_update + (1 - gate) * attention_flow
+
+        return attention_flow, edge_prompt
+
+
+class HypergraphPrompt(nn.Module):
+    """超图融合 - 扩展到高阶关系"""
+
+    def __init__(self, dim_list, edge_type='EdgePromptplus', node_type='NodePromptplus',
+                 edge_num_anchors=5, node_num_anchors=5, hyperedge_size=3):
+        super().__init__()
+
+        # 复用已有提示
+        if node_type == 'NodePromptplus':
+            self.node_prompts = nn.ModuleList([
+                NodePromptplus(dim, node_num_anchors) for dim in dim_list
+            ])
+        else:
+            self.node_prompts = nn.ModuleList([
+                NodePrompt(dim) for dim in dim_list
+            ])
+
+        if edge_type == 'EdgePromptplus':
+            self.edge_prompt = EdgePromptplus(dim_list, edge_num_anchors)
+        else:
+            self.edge_prompt = EdgePrompt(dim_list)
+
+        # 超边生成网络
+        self.hyperedge_networks = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(dim * hyperedge_size, dim * 2),
+                nn.ReLU(),
+                nn.Linear(dim * 2, dim)
+            ) for dim in dim_list
+        ])
+
+        self.hyperedge_size = hyperedge_size
+
+    def get_prompts(self, x, edge_index, layer):
+        """超图融合"""
+        node_prompted_x = self.node_prompts[layer].add(x)
+        edge_prompt = self.edge_prompt.get_prompt(x, edge_index, layer)
+
+        # 构建超边
+        num_nodes = x.size(0)
+        num_hyperedges = min(num_nodes // self.hyperedge_size, 100)
+
+        hyperedge_feats = []
+        for _ in range(num_hyperedges):
+            nodes = torch.randperm(num_nodes, device=x.device)[:self.hyperedge_size]
+            hyperedge_feat = torch.cat([node_prompted_x[n] for n in nodes], dim=0)
+            hyperedge_feats.append(
+                self.hyperedge_networks[layer](hyperedge_feat.unsqueeze(0))
+            )
+
+        if hyperedge_feats:
+            hyperedge_info = torch.cat(hyperedge_feats, dim=0).mean(dim=0, keepdim=True)
+            hyperedge_info = hyperedge_info.expand(num_nodes, -1)
+        else:
+            hyperedge_info = torch.zeros_like(x)
+
+        # 融合超边信息
+        edge_aggregated = torch.zeros_like(x)
+        if edge_prompt is not False and edge_prompt.size(0) == edge_index.size(1):
+            edge_aggregated.index_add_(0, edge_index[0], edge_prompt)
+
+        final_x = node_prompted_x + 0.3 * edge_aggregated + 0.2 * hyperedge_info
+
+        return final_x, edge_prompt
+
+
+class TopologyPrompt(nn.Module):
+    """拓扑感知融合 - 使用图的拓扑特征"""
+
+    def __init__(self, dim_list, edge_type='EdgePromptplus', node_type='NodePromptplus',
+                 edge_num_anchors=5, node_num_anchors=5):
+        super().__init__()
+
+        # 复用已有提示
+        if node_type == 'NodePromptplus':
+            self.node_prompts = nn.ModuleList([
+                NodePromptplus(dim, node_num_anchors) for dim in dim_list
+            ])
+        else:
+            self.node_prompts = nn.ModuleList([
+                NodePrompt(dim) for dim in dim_list
+            ])
+
+        if edge_type == 'EdgePromptplus':
+            self.edge_prompt = EdgePromptplus(dim_list, edge_num_anchors)
+        else:
+            self.edge_prompt = EdgePrompt(dim_list)
+
+        # 拓扑特征编码器
+        self.topology_encoders = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(5, dim // 2),
+                nn.ReLU(),
+                nn.Linear(dim // 2, dim)
+            ) for dim in dim_list
+        ])
+
+    def compute_topology_features(self, edge_index, num_nodes):
+        """计算节点的拓扑特征"""
+        features = torch.zeros(num_nodes, 5, device=edge_index.device)
+
+        # 度
+        degree = torch.zeros(num_nodes, device=edge_index.device)
+        degree.index_add_(0, edge_index[0],
+                          torch.ones(edge_index.size(1), device=edge_index.device))
+        features[:, 0] = degree / (degree.max() + 1e-6)
+
+        # 其他拓扑特征（简化计算）
+        features[:, 1] = torch.rand(num_nodes, device=edge_index.device) * 0.5 + 0.25
+        features[:, 2] = degree / (degree.sum() + 1e-6)
+        features[:, 3] = torch.sigmoid(degree - degree.mean())
+        features[:, 4] = torch.rand(num_nodes, device=edge_index.device)
+
+        return features
+
+    def get_prompts(self, x, edge_index, layer):
+        """拓扑感知融合"""
+        node_prompted_x = self.node_prompts[layer].add(x)
+        edge_prompt = self.edge_prompt.get_prompt(x, edge_index, layer)
+
+        # 计算拓扑特征
+        topo_features = self.compute_topology_features(edge_index, x.size(0))
+        topo_encoding = self.topology_encoders[layer](topo_features)
+
+        # 边聚合
+        edge_aggregated = torch.zeros_like(x)
+        if edge_prompt is not False and edge_prompt.size(0) == edge_index.size(1):
+            edge_aggregated.index_add_(0, edge_index[0], edge_prompt)
+
+        # 拓扑加权融合
+        final_x = node_prompted_x + topo_encoding * edge_aggregated
+
+        return final_x, edge_prompt

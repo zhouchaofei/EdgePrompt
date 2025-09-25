@@ -147,6 +147,155 @@ class GIN(nn.Module):
 
                 h_list.append(x)
 
+        # 新增：层次化图变换器
+        elif prompt_type == 'HierarchicalGraphTransformerPrompt':
+            for layer in range(self.num_layer):
+                final_x, edge_prompt = prompt.get_prompts(h_list[layer], edge_index, layer)
+                x = self.convs[layer](h_list[layer] if edge_prompt is False else final_x,
+                                      edge_index, edge_prompt)
+                x = self.batch_norms[layer](x)
+                if layer == self.num_layer - 1:
+                    x = F.dropout(x, self.drop_ratio, training=self.training)
+                else:
+                    x = F.dropout(F.relu(x), self.drop_ratio, training=self.training)
+                h_list.append(x)
+
+        # 新增：图神经ODE
+        elif prompt_type == 'GraphNeuralODEPrompt':
+            for layer in range(self.num_layer):
+                final_x, edge_prompt = prompt.get_prompts(h_list[layer], edge_index, layer)
+                x = self.convs[layer](final_x, edge_index, edge_prompt)
+                x = self.batch_norms[layer](x)
+                if layer == self.num_layer - 1:
+                    x = F.dropout(x, self.drop_ratio, training=self.training)
+                else:
+                    x = F.dropout(F.relu(x), self.drop_ratio, training=self.training)
+                h_list.append(x)
+
+        # 新增：元学习
+        elif prompt_type == 'MetaLearningPrompt':
+            for layer in range(self.num_layer):
+                final_x, edge_prompt = prompt.get_prompts(h_list[layer], edge_index, layer)
+                x = self.convs[layer](final_x, edge_index, edge_prompt)
+                x = self.batch_norms[layer](x)
+                if layer == self.num_layer - 1:
+                    x = F.dropout(x, self.drop_ratio, training=self.training)
+                else:
+                    x = F.dropout(F.relu(x), self.drop_ratio, training=self.training)
+                h_list.append(x)
+
+        # 新增：因果推理
+        elif prompt_type == 'CausalGraphPrompt':
+            for layer in range(self.num_layer):
+                final_x, edge_prompt = prompt.get_prompts(h_list[layer], edge_index, layer)
+                x = self.convs[layer](final_x, edge_index, edge_prompt)
+                x = self.batch_norms[layer](x)
+                if layer == self.num_layer - 1:
+                    x = F.dropout(x, self.drop_ratio, training=self.training)
+                else:
+                    x = F.dropout(F.relu(x), self.drop_ratio, training=self.training)
+                h_list.append(x)
+
+
+        # 新增：图小波变换
+        elif prompt_type == 'GraphWaveletPrompt':
+            for layer in range(self.num_layer):
+                final_x, edge_prompt = prompt.get_prompts(h_list[layer], edge_index, layer)
+                x = self.convs[layer](final_x, edge_index, edge_prompt)
+                x = self.batch_norms[layer](x)
+                if layer == self.num_layer - 1:
+                    x = F.dropout(x, self.drop_ratio, training=self.training)
+                else:
+                    x = F.dropout(F.relu(x), self.drop_ratio, training=self.training)
+                h_list.append(x)
+
+        # 新增：扩散模型
+        elif prompt_type == 'DiffusionPrompt':
+            for layer in range(self.num_layer):
+                final_x, edge_prompt = prompt.get_prompts(h_list[layer], edge_index, layer)
+                x = self.convs[layer](final_x, edge_index, edge_prompt)
+                x = self.batch_norms[layer](x)
+                if layer == self.num_layer - 1:
+                    x = F.dropout(x, self.drop_ratio, training=self.training)
+                else:
+                    x = F.dropout(F.relu(x), self.drop_ratio, training=self.training)
+                h_list.append(x)
+
+        # 新增：强化学习
+        elif prompt_type == 'RLPrompt':
+            for layer in range(self.num_layer):
+                final_x, edge_prompt = prompt.get_prompts(h_list[layer], edge_index, layer)
+                x = self.convs[layer](final_x, edge_index, edge_prompt)
+                x = self.batch_norms[layer](x)
+                if layer == self.num_layer - 1:
+                    x = F.dropout(x, self.drop_ratio, training=self.training)
+                else:
+                    x = F.dropout(F.relu(x), self.drop_ratio, training=self.training)
+                h_list.append(x)
+
+        # 新增：注意力流
+        elif prompt_type == 'AttentionFlowPrompt':
+            for layer in range(self.num_layer):
+                final_x, edge_prompt = prompt.get_prompts(h_list[layer], edge_index, layer)
+                x = self.convs[layer](final_x, edge_index, edge_prompt)
+                x = self.batch_norms[layer](x)
+                if layer == self.num_layer - 1:
+                    x = F.dropout(x, self.drop_ratio, training=self.training)
+                else:
+                    x = F.dropout(F.relu(x), self.drop_ratio, training=self.training)
+                h_list.append(x)
+
+        # 新增：超图融合
+        elif prompt_type == 'HypergraphPrompt':
+            for layer in range(self.num_layer):
+                final_x, edge_prompt = prompt.get_prompts(h_list[layer], edge_index, layer)
+                x = self.convs[layer](final_x, edge_index, edge_prompt)
+                x = self.batch_norms[layer](x)
+                if layer == self.num_layer - 1:
+                    x = F.dropout(x, self.drop_ratio, training=self.training)
+                else:
+                    x = F.dropout(F.relu(x), self.drop_ratio, training=self.training)
+                h_list.append(x)
+
+        # 新增：拓扑感知
+        elif prompt_type == 'TopologyPrompt':
+            for layer in range(self.num_layer):
+                final_x, edge_prompt = prompt.get_prompts(h_list[layer], edge_index, layer)
+                x = self.convs[layer](final_x, edge_index, edge_prompt)
+                x = self.batch_norms[layer](x)
+                if layer == self.num_layer - 1:
+                    x = F.dropout(x, self.drop_ratio, training=self.training)
+                else:
+                    x = F.dropout(F.relu(x), self.drop_ratio, training=self.training)
+                h_list.append(x)
+
+        # 新增：纯节点提示（已有的NodePrompt作为baseline）
+        elif prompt_type == 'NodePrompt':
+            for layer in range(self.num_layer):
+                # 只使用节点提示，不使用边提示
+                prompted_x = prompt.add(h_list[layer])
+                x = self.convs[layer](prompted_x, edge_index, False)
+                x = self.batch_norms[layer](x)
+                if layer == self.num_layer - 1:
+                    x = F.dropout(x, self.drop_ratio, training=self.training)
+                else:
+                    x = F.dropout(F.relu(x), self.drop_ratio, training=self.training)
+                h_list.append(x)
+
+        # 新增：NodePromptplus作为baseline
+        elif prompt_type == 'NodePromptplus':
+            for layer in range(self.num_layer):
+                # 只使用节点提示plus，不使用边提示
+                prompted_x = prompt.add(h_list[layer])
+                x = self.convs[layer](prompted_x, edge_index, False)
+                x = self.batch_norms[layer](x)
+                if layer == self.num_layer - 1:
+                    x = F.dropout(x, self.drop_ratio, training=self.training)
+                else:
+                    x = F.dropout(F.relu(x), self.drop_ratio, training=self.training)
+                h_list.append(x)
+
+
         # 原有的边提示方法
         elif prompt_type in ['EdgePrompt', 'EdgePromptplus']:
             for layer in range(self.num_layer):

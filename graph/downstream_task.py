@@ -16,27 +16,47 @@ from load_data import GraphDownstream, load_graph_data, get_dataset_info
 from model import GIN
 from prompt import (EdgePrompt, EdgePromptplus, SerialNodeEdgePrompt,
                     ParallelNodeEdgePrompt, InteractiveNodeEdgePrompt, ComplementaryNodeEdgePrompt,
-                    ContrastiveNodeEdgePrompt, SpectralNodeEdgePrompt)
+                    ContrastiveNodeEdgePrompt, SpectralNodeEdgePrompt, HierarchicalGraphTransformerPrompt,
+                    GraphNeuralODEPrompt, MetaLearningPrompt, CausalGraphPrompt, GraphWaveletPrompt, DiffusionPrompt,
+                    RLPrompt, AttentionFlowPrompt, HypergraphPrompt, NodePrompt, TopologyPrompt, NodePromptplus)
 from logger import Logger
 
 
 class GraphTask():
     def __init__(self, dataset_name, shots, gnn_type, num_layer, hidden_dim, device,
                  pretrain_task, prompt_type, num_prompts, logger,
-                 node_prompt_type=None, node_num_prompts=5, fusion_method='weighted'):
+                 node_prompt_type=None, node_num_prompts=5, fusion_method='weighted',
+                 graph_method='correlation_matrix', pretrain_source='auto'):  # 添加graph_method参数
         self.dataset_name = dataset_name
+        self.graph_method = graph_method  # 新增
         self.shots = shots
         self.gnn_type = gnn_type
         self.num_layer = num_layer
         self.hidden_dim = hidden_dim
         self.device = device
         self.pretrain_task = pretrain_task
+        self.pretrain_source = pretrain_source  # 新增
         self.prompt_type = prompt_type
         self.num_prompts = num_prompts
         self.node_prompt_type = node_prompt_type
         self.node_num_prompts = node_num_prompts
         self.fusion_method = fusion_method
         self.logger = logger
+
+        # 日志记录
+        self.logger.info("=" * 60)
+        self.logger.info("初始化GraphTask")
+        self.logger.info("=" * 60)
+        self.logger.info(f"数据集: {dataset_name}")
+        self.logger.info(f"图构建方法: {graph_method}")
+        self.logger.info(f"Few-shot数量: {shots}")
+        self.logger.info(f"GNN类型: {gnn_type}")
+        self.logger.info(f"层数: {num_layer}")
+        self.logger.info(f"隐藏维度: {hidden_dim}")
+        self.logger.info(f"预训练任务: {pretrain_task if pretrain_task else '无'}")
+        self.logger.info(f"Prompt类型: {prompt_type}")
+        self.logger.info(f"预训练源: {pretrain_source}")
+        self.logger.info(f"设备: {device}")
 
         # 加载数据集
         self.load_dataset()
@@ -46,7 +66,8 @@ class GraphTask():
         self.initialize_prompt()
 
     def load_dataset(self):
-        """加载数据集，支持多种类型"""
+        """加载数据集"""
+
         # 获取数据集信息
         dataset_info = get_dataset_info(self.dataset_name)
         if dataset_info:
@@ -54,131 +75,282 @@ class GraphTask():
             self.logger.info(f"任务: {dataset_info.get('task', '未知')}")
             self.logger.info(f"描述: {dataset_info.get('description', '无')}")
 
-        # 支持的所有数据集（更新列表）
+        # 支持的所有数据集
         supported_datasets = [
             # 分子图数据集
             'ENZYMES', 'DD', 'NCI1', 'NCI109', 'Mutagenicity',
-            # ABIDE数据集
-            'ABIDE', 'ABIDE_corr', 'ABIDE_dynamic', 'ABIDE_phase',
-            # MDD数据集
-            'MDD', 'MDD_corr', 'MDD_dynamic', 'MDD_phase',
-            # ADHD数据集
-            'ADHD', 'ADHD_corr', 'ADHD_dynamic', 'ADHD_phase'
+            # 脑成像数据集 - 原始名称
+            'ABIDE', 'MDD', 'ADHD'
         ]
 
-        if self.dataset_name in supported_datasets:
-            self.graph_list, self.input_dim, self.output_dim = load_graph_data(
-                self.dataset_name, data_folder='./data'
-            )
+        # 特殊处理脑成像数据集
+        if self.dataset_name in ['ABIDE', 'MDD', 'ADHD']:
+            # 对于脑成像数据，可能需要调整shots参数
+            max_shots_per_class = 50  # 默认最大值
 
-            # 特殊处理脑成像数据集
-            if self.dataset_name.startswith(('ABIDE', 'MDD', 'ADHD')):
-                # 对于脑成像数据，可能需要调整shots参数
-                max_shots_per_class = 50  # 默认最大值
+            # 根据不同数据集调整
+            if self.dataset_name.startswith('MDD'):
+                max_shots_per_class = 30  # MDD数据可能较少
+            elif self.dataset_name.startswith('ADHD'):
+                max_shots_per_class = 40  # ADHD数据中等
 
-                # 根据不同数据集调整
-                if self.dataset_name.startswith('MDD'):
-                    max_shots_per_class = 30  # MDD数据可能较少
-                elif self.dataset_name.startswith('ADHD'):
-                    max_shots_per_class = 40  # ADHD数据中等
+            if self.shots > max_shots_per_class:
+                self.logger.warning(
+                    f"{self.dataset_name}数据集样本有限，"
+                    f"将shots从{self.shots}调整为{max_shots_per_class}"
+                )
+                self.shots = min(self.shots, max_shots_per_class)
 
-                if self.shots > max_shots_per_class:
-                    self.logger.warning(
-                        f"{self.dataset_name}数据集样本有限，"
-                        f"将shots从{self.shots}调整为{max_shots_per_class}"
-                    )
-                    self.shots = min(self.shots, max_shots_per_class)
+            # 根据graph_method构建实际的数据集名称
+            if hasattr(self, 'graph_method'):
+                if self.graph_method == 'correlation_matrix':
+                    dataset_name_to_load = f"{self.dataset_name}_corr"
+                elif self.graph_method == 'dynamic_connectivity':
+                    dataset_name_to_load = f"{self.dataset_name}_dynamic"
+                elif self.graph_method == 'phase_synchronization':
+                    dataset_name_to_load = f"{self.dataset_name}_phase"
+                else:
+                    dataset_name_to_load = self.dataset_name
+            else:
+                # 如果没有graph_method属性，使用默认
+                dataset_name_to_load = self.dataset_name
 
-                # 检查数据是否成功加载
-                if not self.graph_list or len(self.graph_list) == 0:
-                    self.logger.error(f"数据集 {self.dataset_name} 加载失败或为空")
-                    raise ValueError(f"无法加载数据集 {self.dataset_name}")
-
-            # 划分训练和测试集
-            self.train_data, self.test_data = GraphDownstream(
-                self.graph_list, self.shots, test_fraction=0.4
-            )
-
-            self.logger.info(f"数据集 {self.dataset_name} 加载成功")
-            self.logger.info(f"输入维度: {self.input_dim}, 输出类别数: {self.output_dim}")
-            self.logger.info(f"训练集大小: {len(self.train_data)}, 测试集大小: {len(self.test_data)}")
         else:
-            raise ValueError(
-                f'错误: 无效的数据集名称！\n'
-                f'支持的数据集: {supported_datasets}'
-            )
+            # 分子图数据集直接使用原始名称
+            dataset_name_to_load = self.dataset_name
+
+        # 使用修改后的数据集名称加载数据
+        self.graph_list, self.input_dim, self.output_dim = load_graph_data(
+            dataset_name_to_load, data_folder='./data'
+        )
+
+        # 检查数据是否加载成功
+        if not self.graph_list or len(self.graph_list) == 0:
+            self.logger.error(f"数据集 {self.dataset_name} 加载失败或为空")
+            raise ValueError(f"无法加载数据集 {self.dataset_name}")
+
+        # 划分训练和测试集（这个由GraphDownstream处理）
+        self.train_data, self.test_data = GraphDownstream(
+            self.graph_list, self.shots, test_fraction=0.4
+        )
+
+        self.logger.info(f"数据集 {self.dataset_name} 加载成功")
+        self.logger.info(f"输入维度: {self.input_dim}, 输出类别数: {self.output_dim}")
+        self.logger.info(f"训练集大小: {len(self.train_data)}, 测试集大小: {len(self.test_data)}")
 
     def initialize_model(self):
-        """初始化GNN模型"""
+        """初始化GNN模型并加载预训练权重"""
+
+        # 初始化基础GNN模型
+        self.logger.info(f"初始化{self.gnn_type}模型...")
         if self.gnn_type == 'GIN':
-            self.gnn = GIN(num_layer=self.num_layer, input_dim=self.input_dim, hidden_dim=self.hidden_dim)
+            self.gnn = GIN(
+                num_layer=self.num_layer,
+                input_dim=self.input_dim,
+                hidden_dim=self.hidden_dim
+            )
         else:
-            raise ValueError(f"错误: 无效的GNN类型！支持的GNN: [GIN]")
+            raise ValueError(f"错误: 无效的GNN类型 {self.gnn_type}！")
 
-        # 加载预训练模型（如果有）
-        if self.pretrain_task is not None:
-            # 对于脑成像数据集，预训练模型路径可能不同
-            if self.dataset_name.startswith(('ABIDE', 'MDD', 'ADHD')):
-                # 提取基础数据集名称（去除后缀）
-                base_dataset = self.dataset_name.split('_')[0]
+        # 处理预训练模型加载
+        if self.pretrain_task and self.pretrain_task != 'None' and self.pretrain_task != '':
+            pretrained_gnn_file = self.get_pretrain_model_path()
 
-                # 根据预训练任务选择模型路径
-                if self.pretrain_task == 'GraphMAE':
-                    # GraphMAE跨疾病预训练模型
-                    # 例如：在MDD上训练用于ABIDE，或在ABIDE上训练用于MDD
-                    if base_dataset == 'ABIDE':
-                        pretrained_gnn_file = f'./pretrained_models/graphmae/graphmae_MDD_for_ABIDE_correlation_matrix.pth'
-                    elif base_dataset == 'MDD':
-                        pretrained_gnn_file = f'./pretrained_models/graphmae/graphmae_ABIDE_for_MDD_correlation_matrix.pth'
+            if pretrained_gnn_file and os.path.exists(pretrained_gnn_file):
+                self.logger.info(f"正在加载预训练模型: {pretrained_gnn_file}")
+
+                try:
+                    # 加载checkpoint
+                    checkpoint = torch.load(pretrained_gnn_file, map_location=self.device)
+
+                    # 根据不同的预训练模型格式加载权重
+                    if 'model_state_dict' in checkpoint:
+                        # GraphMAE和EdgePrediction格式
+                        if self.pretrain_task == 'GraphMAE':
+                            # GraphMAE的encoder权重
+                            self.gnn.load_state_dict(checkpoint['model_state_dict'], strict=False)
+                            self.logger.info(f"加载GraphMAE预训练模型: {pretrained_gnn_file}")
+                        elif self.pretrain_task == 'EdgePrediction':
+                            # EdgePrediction的encoder权重
+                            # 需要从EdgePredictionModel中提取encoder部分
+                            encoder_state_dict = {}
+                            for k, v in checkpoint['model_state_dict'].items():
+                                if k.startswith('encoder.'):
+                                    # 移除'encoder.'前缀
+                                    new_k = k.replace('encoder.', '')
+                                    encoder_state_dict[new_k] = v
+                            self.gnn.load_state_dict(encoder_state_dict, strict=False)
+                            self.logger.info(f"加载EdgePrediction预训练模型: {pretrained_gnn_file}")
+                        else:
+                            # 其他格式，尝试直接加载
+                            self.gnn.load_state_dict(checkpoint['model_state_dict'], strict=False)
+                            self.logger.info(f"加载预训练模型: {pretrained_gnn_file}")
+
+                    elif 'state_dict' in checkpoint:
+                        # 分子图预训练模型格式（GraphCL, SimGRACE等）
+                        state_dict = checkpoint['state_dict']
+
+                        # 处理可能的模块前缀问题
+                        new_state_dict = {}
+                        for k, v in state_dict.items():
+                            # 移除可能的module.前缀
+                            if k.startswith('module.'):
+                                new_k = k.replace('module.', '')
+                            else:
+                                new_k = k
+                            new_state_dict[new_k] = v
+
+                        self.gnn.load_state_dict(new_state_dict, strict=False)
+                        self.logger.info(f"加载分子图预训练模型: {pretrained_gnn_file}")
+
                     else:
-                        pretrained_gnn_file = f'./pretrained_models/graphmae/{base_dataset}_graphmae.pth'
+                        # 原始格式
+                        self.gnn.load_state_dict(checkpoint, strict=False)
+                        self.logger.info(f"加载预训练模型: {pretrained_gnn_file}")
 
-                elif self.pretrain_task == 'EdgePrediction':
-                    # Edge Prediction跨疾病预训练模型
-                    if base_dataset == 'ABIDE':
-                        pretrained_gnn_file = f'./pretrained_models/edge_prediction/edge_prediction_MDD_for_ABIDE_correlation_matrix.pth'
-                    elif base_dataset == 'MDD':
-                        pretrained_gnn_file = f'./pretrained_models/edge_prediction/edge_prediction_ABIDE_for_MDD_correlation_matrix.pth'
-                    else:
-                        pretrained_gnn_file = f'./pretrained_models/edge_prediction/{base_dataset}_edge_prediction.pth'
+                    self.logger.info("预训练权重加载成功！")
 
-                else:
-                    # 其他预训练任务
-                    pretrained_gnn_file = f'./pretrained_gnns/{base_dataset}_{self.pretrain_task}_{self.gnn_type}_{self.num_layer}.pth'
-            else:
-                pretrained_gnn_file = f'./pretrained_gnns/{self.dataset_name}_{self.pretrain_task}_{self.gnn_type}_{self.num_layer}.pth'
-
-            if os.path.exists(pretrained_gnn_file):
-                checkpoint = torch.load(pretrained_gnn_file, map_location=self.device)
-
-                # 根据不同的预训练模型格式加载权重
-                if 'model_state_dict' in checkpoint:
-                    # GraphMAE和EdgePrediction格式
-                    if self.pretrain_task == 'GraphMAE':
-                        # GraphMAE的encoder权重
-                        self.gnn.load_state_dict(checkpoint['model_state_dict'], strict=False)
-                        self.logger.info(f"加载GraphMAE预训练模型: {pretrained_gnn_file}")
-                    elif self.pretrain_task == 'EdgePrediction':
-                        # EdgePrediction的encoder权重
-                        # 需要从EdgePredictionModel中提取encoder部分
-                        encoder_state_dict = {}
-                        for k, v in checkpoint['model_state_dict'].items():
-                            if k.startswith('encoder.'):
-                                # 移除'encoder.'前缀
-                                new_k = k.replace('encoder.', '')
-                                encoder_state_dict[new_k] = v
-                        self.gnn.load_state_dict(encoder_state_dict, strict=False)
-                        self.logger.info(f"加载EdgePrediction预训练模型: {pretrained_gnn_file}")
-                else:
-                    # 原始格式
-                    self.gnn.load_state_dict(checkpoint)
-                    self.logger.info(f"加载预训练模型: {pretrained_gnn_file}")
+                except Exception as e:
+                    self.logger.warning(f"加载预训练模型失败: {e}")
+                    self.logger.warning("将从头开始训练...")
             else:
                 self.logger.warning(f"预训练模型不存在: {pretrained_gnn_file}")
+                self.logger.warning("将从头开始训练...")
+        else:
+            self.logger.info("不使用预训练模型，从头开始训练")
 
-        self.logger.info(f"模型结构:\n{self.gnn}")
+        # 多GPU支持
+        # if torch.cuda.device_count() > 1:
+        #     self.logger.info(f"检测到{torch.cuda.device_count()}个GPU，启用数据并行")
+        #     self.gnn = nn.DataParallel(self.gnn)
+
+        # 使用单GPU
         self.gnn.to(self.device)
-        self.classifier = nn.Linear(self.hidden_dim, self.output_dim).to(self.device)
+        self.logger.info(f"使用设备: {self.device}")
+
+        # 初始化分类器
+        self.logger.info("初始化分类器...")
+        self.classifier = nn.Linear(self.hidden_dim, self.output_dim)
+
+        # if torch.cuda.device_count() > 1:
+        #     self.classifier = nn.DataParallel(self.classifier)
+
+        self.classifier.to(self.device)
+
+        # 打印模型信息
+        total_params = sum(p.numel() for p in self.gnn.parameters())
+        trainable_params = sum(p.numel() for p in self.gnn.parameters() if p.requires_grad)
+        self.logger.info(f"模型结构:\n{self.gnn}")
+        self.logger.info(f"模型参数统计:")
+        self.logger.info(f"  总参数量: {total_params:,}")
+        self.logger.info(f"  可训练参数量: {trainable_params:,}")
+
+    def get_pretrain_model_path(self):
+        """根据数据集和预训练任务获取模型路径"""
+
+        # 脑成像数据集的预训练模型路径
+        if self.dataset_name in ['ABIDE', 'MDD', 'ADHD']:
+            pretrain_dir = './pretrained_models'
+
+            if self.pretrain_task == 'GraphMAE':
+                graph_method = getattr(self, 'graph_method', 'correlation_matrix')
+
+                # 获取预训练源设置
+                pretrain_source = getattr(self, 'pretrain_source', 'auto')
+
+                if pretrain_source == 'same':
+                    # 明确使用同疾病预训练
+                    filename = f"graphmae_{self.dataset_name}_for_{self.dataset_name}_{graph_method}.pth"
+                    self.logger.info(f"使用同疾病预训练: {self.dataset_name} -> {self.dataset_name}")
+
+                elif pretrain_source == 'cross':
+                    # 明确使用跨疾病预训练
+                    source = 'ABIDE' if self.dataset_name == 'MDD' else 'MDD'
+                    filename = f"graphmae_{source}_for_{self.dataset_name}_{graph_method}.pth"
+                    self.logger.info(f"使用跨疾病预训练: {source} -> {self.dataset_name}")
+
+                elif pretrain_source == 'auto':
+                    # 自动选择（优先同疾病）
+                    same_filename = f"graphmae_{self.dataset_name}_for_{self.dataset_name}_{graph_method}.pth"
+                    same_path = os.path.join(pretrain_dir, 'graphmae', same_filename)
+
+                    if os.path.exists(same_path):
+                        filename = same_filename
+                        self.logger.info(f"自动选择: 找到同疾病预训练 {self.dataset_name} -> {self.dataset_name}")
+                    else:
+                        source = 'ABIDE' if self.dataset_name == 'MDD' else 'MDD'
+                        filename = f"graphmae_{source}_for_{self.dataset_name}_{graph_method}.pth"
+                        self.logger.info(f"自动选择: 使用跨疾病预训练 {source} -> {self.dataset_name}")
+
+                elif pretrain_source in ['ABIDE', 'MDD', 'ADHD']:
+                    # 直接指定源数据集
+                    filename = f"graphmae_{pretrain_source}_for_{self.dataset_name}_{graph_method}.pth"
+                    self.logger.info(f"使用指定源预训练: {pretrain_source} -> {self.dataset_name}")
+
+                else:
+                    self.logger.warning(f"未知的pretrain_source: {pretrain_source}，使用auto模式")
+                    pretrain_source = 'auto'
+                    # 递归调用auto逻辑
+                    return self.get_pretrain_model_path()
+
+                path = os.path.join(pretrain_dir, 'graphmae', filename)
+
+            elif self.pretrain_task == 'EdgePrediction':
+                # EdgePrediction的逻辑相同
+                graph_method = getattr(self, 'graph_method', 'correlation_matrix')
+                pretrain_source = getattr(self, 'pretrain_source', 'auto')
+
+                if pretrain_source == 'same':
+                    filename = f"edge_prediction_{self.dataset_name}_for_{self.dataset_name}_{graph_method}.pth"
+                    self.logger.info(f"使用同疾病预训练: {self.dataset_name} -> {self.dataset_name}")
+
+                elif pretrain_source == 'cross':
+                    source = 'ABIDE' if self.dataset_name == 'MDD' else 'MDD'
+                    filename = f"edge_prediction_{source}_for_{self.dataset_name}_{graph_method}.pth"
+                    self.logger.info(f"使用跨疾病预训练: {source} -> {self.dataset_name}")
+
+                elif pretrain_source == 'auto':
+                    same_filename = f"edge_prediction_{self.dataset_name}_for_{self.dataset_name}_{graph_method}.pth"
+                    same_path = os.path.join(pretrain_dir, 'edge_prediction', same_filename)
+
+                    if os.path.exists(same_path):
+                        filename = same_filename
+                        self.logger.info(f"自动选择: 找到同疾病预训练 {self.dataset_name} -> {self.dataset_name}")
+                    else:
+                        source = 'ABIDE' if self.dataset_name == 'MDD' else 'MDD'
+                        filename = f"edge_prediction_{source}_for_{self.dataset_name}_{graph_method}.pth"
+                        self.logger.info(f"自动选择: 使用跨疾病预训练 {source} -> {self.dataset_name}")
+
+                elif pretrain_source in ['ABIDE', 'MDD', 'ADHD']:
+                    filename = f"edge_prediction_{pretrain_source}_for_{self.dataset_name}_{graph_method}.pth"
+                    self.logger.info(f"使用指定源预训练: {pretrain_source} -> {self.dataset_name}")
+
+                else:
+                    self.logger.warning(f"未知的pretrain_source: {pretrain_source}，使用auto模式")
+                    return self.get_pretrain_model_path()
+
+                path = os.path.join(pretrain_dir, 'edge_prediction', filename)
+
+            else:
+                # 其他预训练任务
+                filename = f"{self.pretrain_task}.pth"
+                path = os.path.join(pretrain_dir, filename)
+
+            self.logger.info(f"预训练模型路径: {path}")
+            return path
+
+        # 分子图数据集的预训练模型路径（保持不变）
+        elif self.dataset_name in ['ENZYMES', 'DD', 'NCI1', 'NCI109', 'Mutagenicity']:
+            pretrain_dir = './pretrained_gnns'
+
+            if self.pretrain_task and self.pretrain_task != 'None':
+                filename = f"{self.dataset_name}_{self.pretrain_task}_GIN_5.pth"
+                path = os.path.join(pretrain_dir, filename)
+                self.logger.info(f"分子图预训练模型路径: {path}")
+                return path
+
+        return None
+
 
     def initialize_prompt(self):
         """初始化提示模块"""
@@ -258,7 +430,97 @@ class GraphTask():
                 node_num_anchors=self.node_num_prompts,
                 num_filters=8  # 可以从args传入
             ).to(self.device)
+        # 新增方法
+        elif self.prompt_type == 'HierarchicalGraphTransformerPrompt':
+            self.prompt = HierarchicalGraphTransformerPrompt(
+                dim_list=dim_list,
+                edge_num_anchors=self.num_prompts,
+                node_num_anchors=self.node_num_prompts
+            ).to(self.device)
 
+        elif self.prompt_type == 'GraphNeuralODEPrompt':
+            self.prompt = GraphNeuralODEPrompt(
+                dim_list=dim_list,
+                edge_num_anchors=self.num_prompts,
+                node_num_anchors=self.node_num_prompts,
+                ode_steps=5  # 可从args传入
+            ).to(self.device)
+
+        elif self.prompt_type == 'MetaLearningPrompt':
+            self.prompt = MetaLearningPrompt(
+                dim_list=dim_list,
+                edge_num_anchors=self.num_prompts,
+                node_num_anchors=self.node_num_prompts
+            ).to(self.device)
+
+        elif self.prompt_type == 'CausalGraphPrompt':
+            self.prompt = CausalGraphPrompt(
+                dim_list=dim_list,
+                edge_num_anchors=self.num_prompts,
+                node_num_anchors=self.node_num_prompts
+            ).to(self.device)
+
+        # 新增方法初始化
+        elif self.prompt_type == 'GraphWaveletPrompt':
+            self.prompt = GraphWaveletPrompt(
+                dim_list=dim_list,
+                edge_type='EdgePromptplus',
+                node_type='NodePromptplus',
+                edge_num_anchors=self.num_prompts,
+                node_num_anchors=self.node_num_prompts,
+                num_scales=4
+            ).to(self.device)
+
+        elif self.prompt_type == 'DiffusionPrompt':
+            self.prompt = DiffusionPrompt(
+                dim_list=dim_list,
+                edge_num_anchors=self.num_prompts,
+                node_num_anchors=self.node_num_prompts,
+                diffusion_steps=3
+            ).to(self.device)
+
+        elif self.prompt_type == 'RLPrompt':
+            self.prompt = RLPrompt(
+                dim_list=dim_list,
+                edge_num_anchors=self.num_prompts,
+                node_num_anchors=self.node_num_prompts
+            ).to(self.device)
+
+        elif self.prompt_type == 'AttentionFlowPrompt':
+            self.prompt = AttentionFlowPrompt(
+                dim_list=dim_list,
+                edge_num_anchors=self.num_prompts,
+                node_num_anchors=self.node_num_prompts,
+                flow_steps=3
+            ).to(self.device)
+
+        elif self.prompt_type == 'HypergraphPrompt':
+            self.prompt = HypergraphPrompt(
+                dim_list=dim_list,
+                edge_num_anchors=self.num_prompts,
+                node_num_anchors=self.node_num_prompts,
+                hyperedge_size=3
+            ).to(self.device)
+
+        elif self.prompt_type == 'TopologyPrompt':
+            self.prompt = TopologyPrompt(
+                dim_list=dim_list,
+                edge_num_anchors=self.num_prompts,
+                node_num_anchors=self.node_num_prompts
+            ).to(self.device)
+
+        # 纯节点提示baseline
+        elif self.prompt_type == 'NodePrompt':
+            # 为每一层创建NodePrompt
+            self.prompt = nn.ModuleList([
+                NodePrompt(dim) for dim in dim_list
+            ]).to(self.device)
+
+        elif self.prompt_type == 'NodePromptplus':
+            # 为每一层创建NodePromptplus
+            self.prompt = nn.ModuleList([
+                NodePromptplus(dim, self.node_num_prompts) for dim in dim_list
+            ]).to(self.device)
 
         elif self.prompt_type == 'EdgePrompt':
             self.prompt = EdgePrompt(dim_list=dim_list).to(self.device)
@@ -437,7 +699,7 @@ def run(args, seed):
         args.dataset_name, args.shots, args.gnn_type, args.num_layer, args.hidden_dim, device,
         args.pretrain_task, args.prompt_type, args.num_prompts, logger,
         node_prompt_type=args.node_prompt_type, node_num_prompts=args.node_num_prompts,
-        fusion_method=args.fusion_method
+        fusion_method=args.fusion_method, graph_method=args.graph_method, pretrain_source=args.pretrain_source
     )
 
     # 训练
@@ -454,6 +716,9 @@ if __name__ == '__main__':
                              'ABIDE, ABIDE_dynamic, ABIDE_phase, '
                              'MDD, MDD_dynamic, MDD_phase, '
                              'ADHD, ADHD_dynamic, ADHD_phase)')
+    parser.add_argument('--graph_method', type=str, default='correlation_matrix',
+                        choices=['correlation_matrix', 'dynamic_connectivity', 'phase_synchronization'],
+                        help='图构建方法（仅用于脑成像数据）')
     parser.add_argument('--shots', type=int, default=30, help='每类样本数 (default: 30)')
     parser.add_argument('--gnn_type', type=str, default='GIN', help='GNN类型')
     parser.add_argument('--num_layer', type=int, default=5, help='GNN层数 (default: 5)')
@@ -461,12 +726,23 @@ if __name__ == '__main__':
     parser.add_argument('--gpu_id', type=int, default=0, help='GPU设备ID (default: 0)')
     parser.add_argument('--pretrain_task', type=str, default=None, help='预训练任务 (可选)')
 
+    # 新增参数：预训练源控制
+    parser.add_argument('--pretrain_source', type=str, default='auto',
+                        choices=['same', 'cross', 'auto', 'ABIDE', 'MDD', 'ADHD'],
+                        help='预训练模型来源: same(同疾病), cross(跨疾病), auto(自动选择), 或指定具体数据集')
+
     # 提示相关参数
     parser.add_argument('--prompt_type', type=str, default='SerialNodeEdgePrompt',
-                        choices=['EdgePrompt', 'EdgePromptplus', 'SerialNodeEdgePrompt',
-                                 'ParallelNodeEdgePrompt', 'InteractiveNodeEdgePrompt',
-                                 'ComplementaryNodeEdgePrompt', 'ContrastiveNodeEdgePrompt',
-                                 'SpectralNodeEdgePrompt'],
+                        choices=['EdgePrompt', 'EdgePromptplus',
+                                 'NodePrompt', 'NodePromptplus',  # 添加纯节点baseline
+                                 'SerialNodeEdgePrompt', 'ParallelNodeEdgePrompt',
+                                 'InteractiveNodeEdgePrompt', 'ComplementaryNodeEdgePrompt',
+                                 'ContrastiveNodeEdgePrompt', 'SpectralNodeEdgePrompt',
+                                 'HierarchicalGraphTransformerPrompt', 'GraphNeuralODEPrompt',
+                                 'MetaLearningPrompt', 'CausalGraphPrompt',
+                                 'GraphWaveletPrompt', 'DiffusionPrompt',  # 新增方法
+                                 'RLPrompt', 'AttentionFlowPrompt',
+                                 'HypergraphPrompt', 'TopologyPrompt'],
                         help='提示融合方法')
 
     # 新增参数

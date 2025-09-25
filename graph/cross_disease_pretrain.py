@@ -191,6 +191,12 @@ def main():
     # 2. 在MDD上训练，用于ABIDE
     pretrain_on_source('MDD', 'ABIDE', args)
 
+    # 3. 在ABIDE上训练，用于ABIDE
+    pretrain_on_source('ABIDE', 'ABIDE', args)
+
+    # 4. 在MDD上训练，用于MDD
+    pretrain_on_source('MDD', 'MDD', args)
+
 
 if __name__ == '__main__':
     main()
