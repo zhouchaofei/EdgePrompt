@@ -668,6 +668,241 @@ class GraphTask():
         return best_test_accuracy, best_test_f1
 
 
+class SF_DPL_Task(GraphTask):
+    """SF-DPL下游任务"""
+
+    def __init__(self, dataset_name, shots, device, logger,
+                 graph_method='correlation_matrix',
+                 pretrain_task='GraphMAE',
+                 pretrain_source='same'):
+
+        self.dataset_name = dataset_name
+        self.shots = shots
+        self.device = device
+        self.logger = logger
+        self.graph_method = graph_method
+        self.pretrain_task = pretrain_task
+        self.pretrain_source = pretrain_source
+
+        # 加载双流数据
+        self.load_dual_stream_data()
+
+        # 获取输入维度
+        sample_data = self.dual_stream_data[0]
+        input_dim = sample_data[0].x.shape[1]
+
+        self.logger.info(f"检测到输入特征维度: {input_dim}")  # 添加日志
+
+        # 初始化SF-DPL模型
+        from sf_dpl_model import SF_DPL
+
+        self.model = SF_DPL(
+            num_layer=5,
+            input_dim=input_dim,
+            hidden_dim=128,
+            num_classes=2,
+            drop_ratio=0.3
+        ).to(device)
+
+        # 加载预训练权重（关键添加）
+        self.load_pretrained_weights()
+
+        self.optimizer = torch.optim.Adam(self.model.parameters(), lr=0.001)
+
+    def load_pretrained_weights(self):
+        """加载预训练权重到双流编码器"""
+        if self.pretrain_task is None or self.pretrain_task == 'None':
+            self.logger.info("不使用预训练模型")
+            return
+
+        # 确定预训练模型路径
+        if self.pretrain_source == 'same':
+            source = self.dataset_name
+            target = self.dataset_name
+        elif self.pretrain_source == 'cross':
+            # 跨数据集：ABIDE<->MDD
+            source = 'MDD' if self.dataset_name == 'ABIDE' else 'ABIDE'
+            target = self.dataset_name
+        else:
+            # 直接指定源
+            source = self.pretrain_source
+            target = self.dataset_name
+
+        # 构建路径
+        if self.pretrain_task == 'GraphMAE':
+            pretrain_dir = './pretrained_models/graphmae'
+            pretrain_file = f'graphmae_{source}_for_{target}_{self.graph_method}.pth'
+        elif self.pretrain_task == 'EdgePrediction':
+            pretrain_dir = './pretrained_models/edge_prediction'
+            pretrain_file = f'edge_{source}_for_{target}_{self.graph_method}.pth'
+        else:
+            self.logger.warning(f"未知的预训练任务: {self.pretrain_task}")
+            return
+
+        pretrain_path = os.path.join(pretrain_dir, pretrain_file)
+
+        if not os.path.exists(pretrain_path):
+            self.logger.warning(f"预训练模型不存在: {pretrain_path}")
+            self.logger.warning("将从随机初始化开始训练")
+            return
+
+        # 加载权重
+        self.logger.info(f"加载预训练模型: {pretrain_path}")
+        checkpoint = torch.load(pretrain_path, map_location=self.device)
+
+        # 根据不同预训练任务提取encoder权重
+        if 'model_state_dict' in checkpoint:
+            state_dict = checkpoint['model_state_dict']
+        elif 'state_dict' in checkpoint:
+            state_dict = checkpoint['state_dict']
+        else:
+            state_dict = checkpoint
+
+        # 提取encoder部分
+        encoder_state = {}
+        for k, v in state_dict.items():
+            if 'encoder' in k:
+                new_k = k.replace('encoder.', '')
+                encoder_state[new_k] = v
+            elif not any(x in k for x in ['decoder', 'classifier', 'prediction']):
+                encoder_state[k] = v
+
+        # 加载到双流编码器
+        try:
+            # 结构流编码器
+            self.model.struct_encoder.load_state_dict(encoder_state, strict=False)
+            self.logger.info("结构编码器加载预训练权重成功")
+
+            # 功能流编码器
+            self.model.func_encoder.load_state_dict(encoder_state, strict=False)
+            self.logger.info("功能编码器加载预训练权重成功")
+
+        except Exception as e:
+            self.logger.warning(f"加载预训练权重时出现警告: {e}")
+            self.logger.warning("将继续训练...")
+
+    def load_dual_stream_data(self):
+        """加载双流数据"""
+        if self.dataset_name == 'ABIDE':
+            data_path = './data/ABIDE/processed/abide_dual_stream.pt'
+            if not os.path.exists(data_path):
+                from abide_data import ABIDEDataProcessor
+                processor = ABIDEDataProcessor()
+                self.dual_stream_data = processor.process_dual_stream()
+            else:
+                self.dual_stream_data = torch.load(data_path)
+
+        elif self.dataset_name == 'MDD':
+            data_path = './data/REST-meta-MDD/processed/mdd_dual_stream.pt'
+            if not os.path.exists(data_path):
+                from mdd_data import MDDDataProcessor
+                processor = MDDDataProcessor()
+                self.dual_stream_data = processor.process_dual_stream()
+            else:
+                self.dual_stream_data = torch.load(data_path)
+
+        # Few-shot划分
+        labels = [d[0].y.item() for d in self.dual_stream_data]
+        from collections import Counter
+        label_counts = Counter(labels)
+
+        train_idx = []
+        test_idx = []
+
+        for label in label_counts:
+            indices = [i for i, l in enumerate(labels) if l == label]
+            random.shuffle(indices)
+            train_idx.extend(indices[:self.shots])
+            test_idx.extend(indices[self.shots:])
+
+        self.train_data = [self.dual_stream_data[i] for i in train_idx]
+        self.test_data = [self.dual_stream_data[i] for i in test_idx]
+
+        self.logger.info(f"数据集: {self.dataset_name}")
+        self.logger.info(f"训练样本: {len(self.train_data)}")
+        self.logger.info(f"测试样本: {len(self.test_data)}")
+
+    def train_epoch(self):
+        """训练一个epoch"""
+        from torch_geometric.data import Batch
+
+        self.model.train()
+        total_loss = 0
+
+        # 批处理
+        batch_size = 32
+        random.shuffle(self.train_data)
+
+        for i in range(0, len(self.train_data), batch_size):
+            batch_data = self.train_data[i:i + batch_size]
+
+            # 分离双流
+            func_list = [d[0] for d in batch_data]
+            struct_list = [d[1] for d in batch_data]
+
+            func_batch = Batch.from_data_list(func_list).to(self.device)
+            struct_batch = Batch.from_data_list(struct_list).to(self.device)
+
+            # 前向传播
+            self.optimizer.zero_grad()
+            output, ortho_loss = self.model(struct_batch, func_batch)
+
+            # 损失
+            loss = F.cross_entropy(output, func_batch.y) + ortho_loss
+
+            loss.backward()
+            self.optimizer.step()
+
+            total_loss += loss.item()
+
+        return total_loss / (len(self.train_data) // batch_size + 1)
+
+    def evaluate(self):
+        """评估"""
+        from torch_geometric.data import Batch
+        from sklearn.metrics import accuracy_score
+
+        self.model.eval()
+        all_preds = []
+        all_labels = []
+
+        with torch.no_grad():
+            batch_size = 32
+            for i in range(0, len(self.test_data), batch_size):
+                batch_data = self.test_data[i:i + batch_size]
+
+                func_list = [d[0] for d in batch_data]
+                struct_list = [d[1] for d in batch_data]
+
+                func_batch = Batch.from_data_list(func_list).to(self.device)
+                struct_batch = Batch.from_data_list(struct_list).to(self.device)
+
+                output, _ = self.model(struct_batch, func_batch)
+                preds = output.argmax(dim=1)
+
+                all_preds.extend(preds.cpu().numpy())
+                all_labels.extend(func_batch.y.cpu().numpy())
+
+        acc = accuracy_score(all_labels, all_preds)
+        return acc
+
+    def run(self, epochs=100):
+        """运行训练和评估"""
+        best_acc = 0
+
+        for epoch in range(epochs):
+            train_loss = self.train_epoch()
+
+            if epoch % 10 == 0:
+                test_acc = self.evaluate()
+                self.logger.info(f"Epoch {epoch}: Loss={train_loss:.4f}, Acc={test_acc:.4f}")
+
+                if test_acc > best_acc:
+                    best_acc = test_acc
+
+        self.logger.info(f"Best Accuracy: {best_acc:.4f}")
+        return best_acc
+
 def set_random_seed(seed):
     """设置随机种子"""
     random.seed(seed)
@@ -732,7 +967,7 @@ if __name__ == '__main__':
                         help='预训练模型来源: same(同疾病), cross(跨疾病), auto(自动选择), 或指定具体数据集')
 
     # 提示相关参数
-    parser.add_argument('--prompt_type', type=str, default='SerialNodeEdgePrompt',
+    parser.add_argument('--prompt_type', type=str, default=None,
                         choices=['EdgePrompt', 'EdgePromptplus',
                                  'NodePrompt', 'NodePromptplus',  # 添加纯节点baseline
                                  'SerialNodeEdgePrompt', 'ParallelNodeEdgePrompt',
@@ -771,36 +1006,59 @@ if __name__ == '__main__':
     parser.add_argument('--batch_size', type=int, default=32, help='批次大小 (default: 32)')
     parser.add_argument('--epochs', type=int, default=200, help='训练轮数 (default: 200)')
 
+    # 添加SF-DPL特定参数
+    parser.add_argument('--use_sf_dpl', action='store_true', help='使用SF-DPL方法')
+
     args = parser.parse_args()
 
-    # 打印实验配置
-    print("\n" + "="*60)
-    print("实验配置")
-    print("="*60)
-    for key, value in vars(args).items():
-        print(f"{key:20s}: {value}")
-    print("="*60 + "\n")
+    if args.use_sf_dpl:
+        # 运行SF-DPL
+        print("\n运行SF-DPL实验...")
+        from logger import Logger
 
-    # 运行实验
-    all_results_acc = []
-    all_results_f1 = []
+        logger = Logger('sf_dpl.log', None)
+        task = SF_DPL_Task(args.dataset_name, args.shots,
+                           torch.device(f'cuda:{args.gpu_id}'), logger)
+        acc = task.run(epochs=args.epochs)
 
-    for seed in range(5):
-        print(f"\n运行 Seed {seed}...")
-        acc, f1 = run(args, seed)
-        all_results_acc.append(acc)
-        all_results_f1.append(f1)
-        print(f"Seed {seed}: Accuracy = {acc:.4f}, F1 = {f1:.4f}")
+        print(f"\nSF-DPL 最终准确率: {acc:.4f}")
 
-    print(f"\n最终结果 ({args.dataset_name} - {args.prompt_type}):")
-    print(f"平均准确率: {np.mean(all_results_acc):.4f} ± {np.std(all_results_acc):.4f}")
-    print(f"平均F1分数: {np.mean(all_results_f1):.4f} ± {np.std(all_results_f1):.4f}")
+        # 保存结果
+        result_dir = os.path.join('results', args.dataset_name)
+        os.makedirs(result_dir, exist_ok=True)
 
-    # 保存结果
-    result_dir = os.path.join('results', args.dataset_name)
-    os.makedirs(result_dir, exist_ok=True)
+        with open(os.path.join(result_dir, 'sf_dpl_results.txt'), 'a') as f:
+            f.write(f"{args.dataset_name} {args.shots} SF-DPL: Acc={acc:.4f}\n")
 
-    with open(os.path.join(result_dir, f'{args.prompt_type}_results.txt'), 'a') as f:
-        f.write(f"{args.dataset_name} {args.shots} {args.pretrain_task} {args.prompt_type}: ")
-        f.write(f"Acc={np.mean(all_results_acc):.4f}±{np.std(all_results_acc):.4f}, ")
-        f.write(f"F1={np.mean(all_results_f1):.4f}±{np.std(all_results_f1):.4f}\n")
+    else:
+        # 打印实验配置
+        print("\n" + "=" * 60)
+        print("实验配置")
+        print("=" * 60)
+        for key, value in vars(args).items():
+            print(f"{key:20s}: {value}")
+        print("=" * 60 + "\n")
+
+        # 运行实验
+        all_results_acc = []
+        all_results_f1 = []
+
+        for seed in range(5):
+            print(f"\n运行 Seed {seed}...")
+            acc, f1 = run(args, seed)
+            all_results_acc.append(acc)
+            all_results_f1.append(f1)
+            print(f"Seed {seed}: Accuracy = {acc:.4f}, F1 = {f1:.4f}")
+
+        print(f"\n最终结果 ({args.dataset_name} - {args.prompt_type}):")
+        print(f"平均准确率: {np.mean(all_results_acc):.4f} ± {np.std(all_results_acc):.4f}")
+        print(f"平均F1分数: {np.mean(all_results_f1):.4f} ± {np.std(all_results_f1):.4f}")
+
+        # 保存结果
+        result_dir = os.path.join('results', args.dataset_name)
+        os.makedirs(result_dir, exist_ok=True)
+
+        with open(os.path.join(result_dir, f'{args.prompt_type}_results.txt'), 'a') as f:
+            f.write(f"{args.dataset_name} {args.shots} {args.pretrain_task} {args.prompt_type}: ")
+            f.write(f"Acc={np.mean(all_results_acc):.4f}±{np.std(all_results_acc):.4f}, ")
+            f.write(f"F1={np.mean(all_results_f1):.4f}±{np.std(all_results_f1):.4f}\n")

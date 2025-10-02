@@ -273,7 +273,7 @@ class GIN(nn.Module):
         elif prompt_type == 'NodePrompt':
             for layer in range(self.num_layer):
                 # 只使用节点提示，不使用边提示
-                prompted_x = prompt.add(h_list[layer])
+                prompted_x = prompt[layer].add(h_list[layer])
                 x = self.convs[layer](prompted_x, edge_index, False)
                 x = self.batch_norms[layer](x)
                 if layer == self.num_layer - 1:
@@ -286,7 +286,7 @@ class GIN(nn.Module):
         elif prompt_type == 'NodePromptplus':
             for layer in range(self.num_layer):
                 # 只使用节点提示plus，不使用边提示
-                prompted_x = prompt.add(h_list[layer])
+                prompted_x = prompt[layer].add(h_list[layer])
                 x = self.convs[layer](prompted_x, edge_index, False)
                 x = self.batch_norms[layer](x)
                 if layer == self.num_layer - 1:

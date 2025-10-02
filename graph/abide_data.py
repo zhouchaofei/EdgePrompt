@@ -10,7 +10,8 @@ from torch_geometric.data import Data
 from nilearn.datasets import fetch_abide_pcp
 from nilearn.connectome import ConnectivityMeasure
 from sklearn.preprocessing import StandardScaler
-from scipy import stats
+from scipy import signal, stats
+from sklearn.covariance import LedoitWolf
 import warnings
 
 warnings.filterwarnings('ignore')
@@ -440,3 +441,261 @@ def load_abide_data(data_folder='./data', n_subjects=None, graph_method='correla
         output_dim = 2
 
     return graph_list, input_dim, output_dim
+
+# 双流数据处理扩展
+class ABIDEDualStream:
+    """ABIDE双流数据处理扩展"""
+
+    def __init__(self, original_processor):
+        """基于原有ABIDE处理器扩展"""
+        self.processor = original_processor
+
+    def construct_dual_stream(self, time_series, label):
+        """为单个被试构建双流数据"""
+        # 功能流：多种连接矩阵融合
+        func_matrix = self._construct_functional_network(time_series)
+
+        # 结构流：稳定连接
+        struct_matrix = self._construct_structural_network(time_series)
+
+        # 节点特征
+        func_features = self._extract_functional_features(time_series)
+        struct_features = self._extract_structural_features(time_series)
+
+        # 转换为PyG格式
+        func_data = self._matrix_to_pyg(func_matrix, func_features, label)
+        struct_data = self._matrix_to_pyg(struct_matrix, struct_features, label)
+
+        return func_data, struct_data
+
+    def _construct_functional_network(self, time_series):
+        """构建功能网络"""
+        # 相关矩阵
+        corr = np.corrcoef(time_series.T)
+        corr = np.nan_to_num(corr, 0)
+        np.fill_diagonal(corr, 0)
+
+        # 偏相关（针对ASD）
+        try:
+            cov = LedoitWolf().fit(time_series)
+            precision = cov.precision_
+            diag = np.sqrt(np.diag(precision))
+            partial = -precision / np.outer(diag, diag)
+            np.fill_diagonal(partial, 0)
+        except:
+            partial = corr.copy()
+
+        # 相位同步（针对ASD长程连接）
+        phase_sync = self._phase_synchronization(time_series)
+
+        # 融合：ASD特别关注相位同步
+        func_matrix = (corr + partial + phase_sync * 1.5) / 3.5
+
+        # 阈值化
+        threshold = np.percentile(np.abs(func_matrix), 70)
+        func_matrix[np.abs(func_matrix) < threshold] = 0
+
+        return func_matrix
+
+    def _construct_structural_network(self, time_series):
+        """构建结构网络（伪）"""
+        # 使用稳定的强连接
+        corr = np.corrcoef(time_series.T)
+        corr = np.nan_to_num(corr, 0)
+
+        # 只保留最强连接
+        threshold = np.percentile(np.abs(corr), 95)
+        struct = np.zeros_like(corr)
+        struct[np.abs(corr) > threshold] = 1
+        np.fill_diagonal(struct, 0)
+
+        return struct
+
+    def _phase_synchronization(self, time_series):
+        """计算相位同步（ASD关键特征）"""
+        from scipy.signal import hilbert
+        n_regions = time_series.shape[1]
+        phase_sync = np.zeros((n_regions, n_regions))
+
+        for i in range(n_regions):
+            for j in range(i + 1, n_regions):
+                # Hilbert变换
+                phase_i = np.angle(hilbert(time_series[:, i]))
+                phase_j = np.angle(hilbert(time_series[:, j]))
+
+                # 相位锁定值
+                plv = np.abs(np.mean(np.exp(1j * (phase_i - phase_j))))
+                phase_sync[i, j] = phase_sync[j, i] = plv
+
+        return phase_sync
+
+    def _extract_functional_features(self, time_series):
+        """提取功能特征"""
+        features = []
+
+        for i in range(time_series.shape[1]):
+            ts = time_series[:, i]
+            feat = [
+                np.mean(ts), np.std(ts),
+                stats.skew(ts), stats.kurtosis(ts),
+                np.percentile(ts, 25), np.percentile(ts, 75)
+            ]
+
+            # 频域特征
+            freqs, psd = signal.welch(ts, fs=0.5, nperseg=min(len(ts), 64))
+            freq_bands = [(0.01, 0.04), (0.04, 0.08), (0.08, 0.13), (0.13, 0.30)]
+            for low, high in freq_bands:
+                idx = (freqs >= low) & (freqs <= high)
+                feat.append(np.mean(psd[idx]) if np.any(idx) else 0)
+
+            features.append(feat)
+
+        features = np.array(features, dtype=np.float32)
+        # 标准化
+        from sklearn.preprocessing import StandardScaler
+        features = StandardScaler().fit_transform(features)
+
+        return torch.tensor(features, dtype=torch.float)
+
+    def _extract_structural_features(self, time_series):
+        """提取结构特征（简化版）"""
+        features = []
+
+        for i in range(time_series.shape[1]):
+            ts = time_series[:, i]
+            # 基础统计特征
+            feat = [
+                np.mean(ts), np.std(ts),
+                np.median(ts), np.ptp(ts)
+            ]
+            features.append(feat)
+
+        features = np.array(features, dtype=np.float32)
+        from sklearn.preprocessing import StandardScaler
+        features = StandardScaler().fit_transform(features)
+
+        return torch.tensor(features, dtype=torch.float)
+
+    def _matrix_to_pyg(self, matrix, features, label):
+        """转换为PyG Data对象"""
+        edge_index = []
+        edge_attr = []
+
+        n = matrix.shape[0]
+        for i in range(n):
+            for j in range(i + 1, n):
+                if matrix[i, j] != 0:
+                    edge_index.extend([[i, j], [j, i]])
+                    edge_attr.extend([matrix[i, j], matrix[i, j]])
+
+        edge_index = torch.tensor(edge_index, dtype=torch.long).t()
+        edge_attr = torch.tensor(edge_attr, dtype=torch.float)
+
+        return Data(
+            x=features,
+            edge_index=edge_index,
+            edge_attr=edge_attr,
+            y=torch.tensor([label], dtype=torch.long)
+        )
+
+
+# 在ABIDEDataProcessor类中添加双流处理方法
+def process_dual_stream(self):
+    """添加到ABIDEDataProcessor类的方法"""
+    dual_processor = ABIDEDualStream(self)
+    dual_stream_data = []
+
+    # 先加载数据
+    data = self.download_data(n_subjects=None)
+
+    print("构建双流数据...")
+
+    # 检查不同的可能属性名
+    rois_data = None
+    for attr in ['rois_ho', 'rois_cc200', 'rois_cc400', 'rois_aal', 'rois_ez', 'rois_dosenbach160']:
+        if hasattr(data, attr):
+            rois_data = getattr(data, attr)
+            if rois_data is not None:
+                break
+
+    if rois_data is None:
+        print("未找到ROI数据")
+        return []
+
+    # 获取标签
+    labels = data.phenotypic['DX_GROUP'].values - 1
+
+    for idx, roi_file in enumerate(rois_data):
+        try:
+            if roi_file is None:
+                continue
+
+            # 处理不同格式的数据
+            if isinstance(roi_file, str) and os.path.exists(roi_file):
+                time_series = pd.read_csv(roi_file, sep='\t', header=0).values
+            elif isinstance(roi_file, np.ndarray):
+                time_series = roi_file
+            else:
+                continue
+
+            if time_series.shape[0] < 50:
+                continue
+
+            label = labels[idx]
+
+            # 构建双流
+            func_data, struct_data = dual_processor.construct_dual_stream(
+                time_series, label
+            )
+            dual_stream_data.append((func_data, struct_data))
+
+            if (idx + 1) % 10 == 0:
+                print(f"处理进度: {idx + 1}/{len(rois_data)}")
+
+        except Exception as e:
+            print(f"处理被试{idx}失败: {e}")
+            continue
+
+    print(f"成功构建{len(dual_stream_data)}个双流样本")
+
+    # 保存
+    save_path = os.path.join(self.processed_path, 'abide_dual_stream.pt')
+    torch.save(dual_stream_data, save_path)
+    print(f"数据已保存至: {save_path}")
+
+    return dual_stream_data
+
+
+# 为了兼容，在ABIDEDataProcessor类后添加
+ABIDEDataProcessor.process_dual_stream = process_dual_stream
+
+# 添加主函数，使文件可以直接运行
+if __name__ == "__main__":
+    print("=" * 60)
+    print("ABIDE数据集处理")
+    print("=" * 60)
+
+    # 创建处理器
+    processor = ABIDEDataProcessor(
+        data_folder='./data',
+        pipeline='cpac',
+        atlas='ho',
+        connectivity_kind='correlation',
+        threshold=0.3
+
+    )
+
+    # 1. 下载和处理基础数据
+    print("\n1. 处理基础数据...")
+    graph_list = processor.process_and_save(
+        n_subjects=None,  # 处理所有被试
+        graph_method='correlation_matrix'
+    )
+    print(f"基础数据处理完成: {len(graph_list)} 个样本")
+
+    # 2. 构建双流数据
+    print("\n2. 构建双流数据...")
+    dual_stream_data = processor.process_dual_stream()
+    print(f"双流数据构建完成: {len(dual_stream_data)} 个样本")
+
+    print("\n处理完成！")

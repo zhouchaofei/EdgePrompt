@@ -404,3 +404,277 @@ def load_mdd_data(data_folder='./data', graph_method='correlation_matrix'):
         output_dim = 2
 
     return graph_list, input_dim, output_dim
+
+
+class MDDDualStream:
+    """MDD双流数据处理扩展"""
+
+    def __init__(self, original_processor):
+        self.processor = original_processor
+
+    def load_rest_meta_mdd(self):
+        """加载REST-meta-MDD数据"""
+        mdd_path = os.path.join(self.processor.data_folder, 'REST-meta-MDD')
+        roi_path = os.path.join(mdd_path, 'Results', 'ROISignals_FunImgARCWF')
+
+        if not os.path.exists(roi_path):
+            print(f"请下载REST-meta-MDD到: {mdd_path}")
+            return []
+
+        # 加载人口学数据
+        demo_file = os.path.join(mdd_path, 'Demographic_Data.xlsx')
+        if os.path.exists(demo_file):
+            demographics = pd.read_excel(demo_file)
+        else:
+            demographics = None
+
+        dual_stream_data = []
+
+        # 遍历站点
+        sites = [d for d in os.listdir(roi_path)
+                 if os.path.isdir(os.path.join(roi_path, d))]
+
+        for site in sites:
+            site_path = os.path.join(roi_path, site)
+            roi_files = glob.glob(os.path.join(site_path, '*.txt'))
+
+            for roi_file in roi_files:
+                try:
+                    # 加载时间序列
+                    time_series = np.loadtxt(roi_file)
+
+                    if time_series.shape[0] < 50:
+                        continue
+
+                    # 确保维度正确
+                    if time_series.shape[1] > time_series.shape[0]:
+                        time_series = time_series.T
+
+                    # 标准化到116个ROI
+                    if time_series.shape[1] != 116:
+                        if time_series.shape[1] > 116:
+                            time_series = time_series[:, :116]
+                        else:
+                            padding = np.zeros((time_series.shape[0], 116 - time_series.shape[1]))
+                            time_series = np.concatenate([time_series, padding], axis=1)
+
+                    # 获取标签（简化：从文件名判断）
+                    filename = os.path.basename(roi_file)
+                    label = 1 if 'MDD' in filename.upper() else 0
+
+                    # 构建双流
+                    func_data, struct_data = self.construct_mdd_dual_stream(
+                        time_series, label
+                    )
+                    dual_stream_data.append((func_data, struct_data))
+
+                except Exception as e:
+                    continue
+
+        print(f"加载了{len(dual_stream_data)}个MDD双流样本")
+
+        # 保存
+        save_path = os.path.join(self.processor.processed_path, 'mdd_dual_stream.pt')
+        torch.save(dual_stream_data, save_path)
+
+        return dual_stream_data
+
+    def construct_mdd_dual_stream(self, time_series, label):
+        """MDD特定的双流构建"""
+        # 功能流：关注动态变化（MDD情绪波动）
+        func_matrix = self._construct_mdd_functional(time_series)
+
+        # 结构流
+        struct_matrix = self._construct_mdd_structural(time_series)
+
+        # 特征
+        func_features = self._extract_mdd_functional_features(time_series)
+        struct_features = self._extract_mdd_structural_features(time_series)
+
+        # 转PyG
+        func_data = self._matrix_to_pyg(func_matrix, func_features, label)
+        struct_data = self._matrix_to_pyg(struct_matrix, struct_features, label)
+
+        return func_data, struct_data
+
+    def _construct_mdd_functional(self, time_series):
+        """MDD功能网络：强调动态"""
+        # 动态连接
+        dynamic_conn = self._compute_dynamic_connectivity(time_series)
+
+        # 标准相关
+        corr = np.corrcoef(time_series.T)
+        corr = np.nan_to_num(corr, 0)
+        np.fill_diagonal(corr, 0)
+
+        # 融合（MDD强调动态）
+        func_matrix = (corr + dynamic_conn * 2) / 3
+
+        # 阈值化
+        threshold = np.percentile(np.abs(func_matrix), 70)
+        func_matrix[np.abs(func_matrix) < threshold] = 0
+
+        return func_matrix
+
+    def _compute_dynamic_connectivity(self, time_series, window_size=30):
+        """计算动态连接"""
+        n_regions = time_series.shape[1]
+        n_windows = (time_series.shape[0] - window_size) // 10 + 1
+
+        dynamic_matrices = []
+        for w in range(n_windows):
+            start = w * 10
+            end = start + window_size
+            if end > time_series.shape[0]:
+                break
+
+            window_corr = np.corrcoef(time_series[start:end].T)
+            window_corr = np.nan_to_num(window_corr, 0)
+            dynamic_matrices.append(window_corr)
+
+        if len(dynamic_matrices) > 1:
+            # 返回标准差（变异性）
+            return np.std(dynamic_matrices, axis=0)
+        else:
+            return np.zeros((n_regions, n_regions))
+
+    def _construct_mdd_structural(self, time_series):
+        """MDD结构网络"""
+        corr = np.corrcoef(time_series.T)
+        corr = np.nan_to_num(corr, 0)
+
+        # 强连接作为结构
+        threshold = np.percentile(np.abs(corr), 95)
+        struct = np.zeros_like(corr)
+        struct[np.abs(corr) > threshold] = 1
+        np.fill_diagonal(struct, 0)
+
+        return struct
+
+    def _extract_mdd_functional_features(self, time_series):
+        """MDD功能特征"""
+        features = []
+
+        for i in range(time_series.shape[1]):
+            ts = time_series[:, i]
+            feat = [
+                np.mean(ts), np.std(ts),
+                stats.skew(ts), stats.kurtosis(ts),
+                np.ptp(ts)  # 范围（情绪波动）
+            ]
+
+            # MDD相关的低频振荡
+            freqs, psd = signal.welch(ts, fs=0.5, nperseg=min(len(ts), 64))
+            # Slow-5 and Slow-4
+            idx = (freqs >= 0.01) & (freqs <= 0.073)
+            feat.append(np.mean(psd[idx]) if np.any(idx) else 0)
+
+            features.append(feat)
+
+        features = np.array(features, dtype=np.float32)
+        from sklearn.preprocessing import StandardScaler
+        features = StandardScaler().fit_transform(features)
+
+        return torch.tensor(features, dtype=torch.float)
+
+    def _extract_mdd_structural_features(self, time_series):
+        """MDD结构特征"""
+        return self._extract_mdd_functional_features(time_series)[:, :4]
+
+    def _matrix_to_pyg(self, matrix, features, label):
+        """转换为PyG格式"""
+        edge_index = []
+        edge_attr = []
+
+        n = matrix.shape[0]
+        for i in range(n):
+            for j in range(i + 1, n):
+                if matrix[i, j] != 0:
+                    edge_index.extend([[i, j], [j, i]])
+                    edge_attr.extend([matrix[i, j], matrix[i, j]])
+
+        edge_index = torch.tensor(edge_index, dtype=torch.long).t()
+        edge_attr = torch.tensor(edge_attr, dtype=torch.float)
+
+        return Data(
+            x=features,
+            edge_index=edge_index,
+            edge_attr=edge_attr,
+            y=torch.tensor([label], dtype=torch.long)
+        )
+
+
+# 修正：为MDDDataProcessor类添加方法
+def process_dual_stream(self):
+    """添加到MDDDataProcessor类的方法"""
+    dual_processor = MDDDualStream(self)
+    dual_stream_data = []
+
+    # 加载ROI信号数据
+    data_dict = self.load_roi_signals()
+
+    if len(data_dict['time_series']) == 0:
+        print("未找到MDD数据，创建模拟数据...")
+        data_dict = self.create_mock_data(n_subjects=60)
+
+    print("构建双流数据...")
+
+    for idx, time_series in enumerate(data_dict['time_series']):
+        try:
+            if time_series.shape[0] < 50:
+                continue
+
+            label = data_dict['labels'][idx]
+
+            # 构建双流
+            func_data, struct_data = dual_processor.construct_mdd_dual_stream(
+                time_series, label
+            )
+            dual_stream_data.append((func_data, struct_data))
+
+            if (idx + 1) % 10 == 0:
+                print(f"处理进度: {idx + 1}/{len(data_dict['time_series'])}")
+
+        except Exception as e:
+            print(f"处理被试{idx}失败: {e}")
+            continue
+
+    print(f"成功构建{len(dual_stream_data)}个双流样本")
+
+    # 保存
+    save_path = os.path.join(self.processed_path, 'mdd_dual_stream.pt')
+    torch.save(dual_stream_data, save_path)
+    print(f"数据已保存至: {save_path}")
+
+    return dual_stream_data
+
+
+# 正确的类名：MDDDataProcessor
+MDDDataProcessor.process_dual_stream = process_dual_stream
+
+# 添加主函数
+if __name__ == "__main__":
+    print("=" * 60)
+    print("MDD数据集处理")
+    print("=" * 60)
+
+    # 创建处理器
+    processor = MDDDataProcessor(
+        data_folder='./data',
+        connectivity_kind='correlation',
+        threshold=0.3
+    )
+
+    # 1. 处理基础数据
+    print("\n1. 处理基础数据...")
+    graph_list = processor.process_and_save(
+        graph_method='correlation_matrix'
+    )
+    print(f"基础数据处理完成: {len(graph_list)} 个样本")
+
+    # 2. 构建双流数据
+    print("\n2. 构建双流数据...")
+    dual_stream_data = processor.process_dual_stream()
+    print(f"双流数据构建完成: {len(dual_stream_data)} 个样本")
+
+    print("\n处理完成！")

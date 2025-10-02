@@ -50,9 +50,9 @@ def pretrain_edge_prediction(source_dataset, target_dataset, args):
         target_dataset: 目标数据集名称 ('ABIDE' 或 'MDD')
         args: 参数
     """
-    print(f"\n{'=' * 60}")
+    print(f"\n{'='*60}")
     print(f"Edge Prediction: 在 {source_dataset} 上预训练，用于 {target_dataset}")
-    print(f"{'=' * 60}")
+    print(f"{'='*60}")
 
     # 加载源数据集
     print(f"加载 {source_dataset} 数据集...")
@@ -145,12 +145,19 @@ def pretrain_edge_prediction(source_dataset, target_dataset, args):
 def main():
     parser = argparse.ArgumentParser(description='Edge Prediction跨疾病预训练')
 
+    parser.add_argument('--source', type=str, required=True,
+                       choices=['ABIDE', 'MDD', 'ADHD'],
+                       help='源数据集（用于训练）')
+    parser.add_argument('--target', type=str, required=True,
+                       choices=['ABIDE', 'MDD', 'ADHD'],
+                       help='目标数据集（用于下游任务）')
+
     # 数据相关参数
     parser.add_argument('--data_folder', type=str, default='./data',
-                        help='数据文件夹路径')
+                       help='数据文件夹路径')
     parser.add_argument('--graph_method', type=str, default='correlation_matrix',
-                        choices=['correlation_matrix', 'dynamic_connectivity', 'phase_synchronization'],
-                        help='图构建方法')
+                       choices=['correlation_matrix', 'dynamic_connectivity', 'phase_synchronization'],
+                       help='图构建方法')
 
     # 模型相关参数
     parser.add_argument('--num_layer', type=int, default=5, help='GNN层数')
@@ -167,25 +174,27 @@ def main():
     parser.add_argument('--gpu_id', type=int, default=0, help='GPU设备ID')
     parser.add_argument('--seed', type=int, default=42, help='随机种子')
     parser.add_argument('--save_dir', type=str, default='./pretrained_models/edge_prediction',
-                        help='模型保存目录')
+                       help='模型保存目录')
 
     args = parser.parse_args()
 
     # 设置随机种子
     set_random_seed(args.seed)
 
+    pretrain_edge_prediction(args.source, args.target, args)
+
     # 执行跨疾病Edge Prediction预训练
     # 1. 在ABIDE上训练，用于MDD
-    pretrain_edge_prediction('ABIDE', 'MDD', args)
+    # pretrain_edge_prediction('ABIDE', 'MDD', args)
 
     # 2. 在MDD上训练，用于ABIDE
-    pretrain_edge_prediction('MDD', 'ABIDE', args)
+    # pretrain_edge_prediction('MDD', 'ABIDE', args)
 
     # 3. 在ABIDE上训练，用于ABIDE
-    pretrain_edge_prediction('ABIDE', 'ABIDE', args)
+    # pretrain_edge_prediction('ABIDE', 'ABIDE', args)
 
     # 4. 在MDD上训练，用于MDD
-    pretrain_edge_prediction('MDD', 'MDD', args)
+    # pretrain_edge_prediction('MDD', 'MDD', args)
 
 
 if __name__ == '__main__':
