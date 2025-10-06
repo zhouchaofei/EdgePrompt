@@ -469,18 +469,31 @@ class ABIDEDualStream:
         return func_data, struct_data
 
     def _construct_functional_network(self, time_series):
-        """构建功能网络"""
+        """构建功能网络（添加 nan 处理）"""
+        # 预处理时间序列
+        time_series = np.nan_to_num(time_series, nan=0.0, posinf=0.0, neginf=0.0)
+
+        # 检查是否有全0列
+        for col in range(time_series.shape[1]):
+            if np.std(time_series[:, col]) < 1e-6:
+                time_series[:, col] = np.random.randn(time_series.shape[0]) * 0.01
+
         # 相关矩阵
-        corr = np.corrcoef(time_series.T)
-        corr = np.nan_to_num(corr, 0)
-        np.fill_diagonal(corr, 0)
+        try:
+            corr = np.corrcoef(time_series.T)
+            corr = np.nan_to_num(corr, nan=0.0, posinf=0.0, neginf=0.0)
+            np.fill_diagonal(corr, 0)
+        except:
+            corr = np.zeros((time_series.shape[1], time_series.shape[1]))
 
         # 偏相关（针对ASD）
         try:
             cov = LedoitWolf().fit(time_series)
             precision = cov.precision_
             diag = np.sqrt(np.diag(precision))
+            diag = np.where(diag < 1e-6, 1.0, diag)  # 避免除零
             partial = -precision / np.outer(diag, diag)
+            partial = np.nan_to_num(partial, nan=0.0, posinf=0.0, neginf=0.0)
             np.fill_diagonal(partial, 0)
         except:
             partial = corr.copy()
@@ -490,6 +503,7 @@ class ABIDEDualStream:
 
         # 融合：ASD特别关注相位同步
         func_matrix = (corr + partial + phase_sync * 1.5) / 3.5
+        func_matrix = np.nan_to_num(func_matrix, nan=0.0, posinf=0.0, neginf=0.0)
 
         # 阈值化
         threshold = np.percentile(np.abs(func_matrix), 70)
@@ -498,10 +512,16 @@ class ABIDEDualStream:
         return func_matrix
 
     def _construct_structural_network(self, time_series):
-        """构建结构网络（伪）"""
+        """构建结构网络（伪）（添加 nan 处理）"""
+        # 预处理
+        time_series = np.nan_to_num(time_series, nan=0.0, posinf=0.0, neginf=0.0)
+
         # 使用稳定的强连接
-        corr = np.corrcoef(time_series.T)
-        corr = np.nan_to_num(corr, 0)
+        try:
+            corr = np.corrcoef(time_series.T)
+            corr = np.nan_to_num(corr, nan=0.0, posinf=0.0, neginf=0.0)
+        except:
+            corr = np.zeros((time_series.shape[1], time_series.shape[1]))
 
         # 只保留最强连接
         threshold = np.percentile(np.abs(corr), 95)
@@ -512,84 +532,189 @@ class ABIDEDualStream:
         return struct
 
     def _phase_synchronization(self, time_series):
-        """计算相位同步（ASD关键特征）"""
+        """计算相位同步（ASD关键特征）（添加 nan 处理）"""
         from scipy.signal import hilbert
         n_regions = time_series.shape[1]
         phase_sync = np.zeros((n_regions, n_regions))
 
         for i in range(n_regions):
             for j in range(i + 1, n_regions):
-                # Hilbert变换
-                phase_i = np.angle(hilbert(time_series[:, i]))
-                phase_j = np.angle(hilbert(time_series[:, j]))
+                try:
+                    # 检查输入
+                    ts_i = time_series[:, i]
+                    ts_j = time_series[:, j]
 
-                # 相位锁定值
-                plv = np.abs(np.mean(np.exp(1j * (phase_i - phase_j))))
-                phase_sync[i, j] = phase_sync[j, i] = plv
+                    if np.isnan(ts_i).any() or np.isnan(ts_j).any():
+                        ts_i = np.nan_to_num(ts_i, nan=0.0)
+                        ts_j = np.nan_to_num(ts_j, nan=0.0)
 
+                    # 去除常数序列
+                    if np.std(ts_i) < 1e-6 or np.std(ts_j) < 1e-6:
+                        phase_sync[i, j] = phase_sync[j, i] = 0.0
+                        continue
+
+                    # Hilbert变换
+                    phase_i = np.angle(hilbert(ts_i))
+                    phase_j = np.angle(hilbert(ts_j))
+
+                    # 相位锁定值
+                    plv = np.abs(np.mean(np.exp(1j * (phase_i - phase_j))))
+
+                    if np.isnan(plv) or np.isinf(plv):
+                        plv = 0.0
+
+                    phase_sync[i, j] = phase_sync[j, i] = plv
+
+                except Exception as e:
+                    phase_sync[i, j] = phase_sync[j, i] = 0.0
+
+        # 最终检查
+        phase_sync = np.nan_to_num(phase_sync, nan=0.0, posinf=0.0, neginf=0.0)
         return phase_sync
 
     def _extract_functional_features(self, time_series):
-        """提取功能特征"""
+        """提取功能特征（添加 nan 处理）"""
         features = []
 
         for i in range(time_series.shape[1]):
             ts = time_series[:, i]
-            feat = [
-                np.mean(ts), np.std(ts),
-                stats.skew(ts), stats.kurtosis(ts),
-                np.percentile(ts, 25), np.percentile(ts, 75)
-            ]
 
-            # 频域特征
-            freqs, psd = signal.welch(ts, fs=0.5, nperseg=min(len(ts), 64))
-            freq_bands = [(0.01, 0.04), (0.04, 0.08), (0.08, 0.13), (0.13, 0.30)]
-            for low, high in freq_bands:
-                idx = (freqs >= low) & (freqs <= high)
-                feat.append(np.mean(psd[idx]) if np.any(idx) else 0)
+            # 检查并处理nan值
+            if np.isnan(ts).any():
+                ts = np.nan_to_num(ts, nan=0.0, posinf=0.0, neginf=0.0)
 
+            # 如果整个时间序列都是0或常数
+            if np.std(ts) < 1e-6:
+                ts = ts + np.random.randn(len(ts)) * 0.01
+
+            try:
+                feat = [
+                    np.mean(ts),
+                    np.std(ts) if np.std(ts) > 0 else 1e-6,
+                    stats.skew(ts) if not np.isnan(stats.skew(ts)) else 0.0,
+                    stats.kurtosis(ts) if not np.isnan(stats.kurtosis(ts)) else 0.0,
+                    np.percentile(ts, 25),
+                    np.percentile(ts, 75)
+                ]
+
+                # 频域特征
+                try:
+                    freqs, psd = signal.welch(ts, fs=0.5, nperseg=min(len(ts), 64))
+                    freq_bands = [(0.01, 0.04), (0.04, 0.08), (0.08, 0.13), (0.13, 0.30)]
+                    for low, high in freq_bands:
+                        idx = (freqs >= low) & (freqs <= high)
+                        if np.any(idx):
+                            band_power = np.mean(psd[idx])
+                            feat.append(band_power if not np.isnan(band_power) else 0.0)
+                        else:
+                            feat.append(0.0)
+                except:
+                    feat.extend([0.0] * 4)
+            except:
+                feat = [0.0] * 10
+
+            # 再次检查是否有nan
+            feat = [0.0 if np.isnan(f) or np.isinf(f) else f for f in feat]
             features.append(feat)
 
         features = np.array(features, dtype=np.float32)
-        # 标准化
+        features = np.nan_to_num(features, nan=0.0, posinf=0.0, neginf=0.0)
+
+        # 标准化（处理全0列）
         from sklearn.preprocessing import StandardScaler
-        features = StandardScaler().fit_transform(features)
+        scaler = StandardScaler()
+
+        # 检查是否有全0或常数列
+        for col in range(features.shape[1]):
+            if np.std(features[:, col]) < 1e-6:
+                features[:, col] = np.random.randn(features.shape[0]) * 0.01
+
+        features = scaler.fit_transform(features)
+        features = np.nan_to_num(features, nan=0.0, posinf=0.0, neginf=0.0)
 
         return torch.tensor(features, dtype=torch.float)
 
     def _extract_structural_features(self, time_series):
-        """提取结构特征（简化版）"""
+        """提取结构特征（简化版）（添加 nan 处理）"""
         features = []
 
         for i in range(time_series.shape[1]):
             ts = time_series[:, i]
-            # 基础统计特征
-            feat = [
-                np.mean(ts), np.std(ts),
-                np.median(ts), np.ptp(ts)
-            ]
+
+            # 检查并处理nan值
+            if np.isnan(ts).any():
+                ts = np.nan_to_num(ts, nan=0.0, posinf=0.0, neginf=0.0)
+
+            # 如果整个时间序列都是0或常数
+            if np.std(ts) < 1e-6:
+                ts = ts + np.random.randn(len(ts)) * 0.01
+
+            try:
+                feat = [
+                    np.mean(ts),
+                    np.std(ts) if np.std(ts) > 0 else 1e-6,
+                    np.median(ts),
+                    np.ptp(ts) if np.ptp(ts) > 0 else 1e-6
+                ]
+            except:
+                feat = [0.0, 1.0, 0.0, 1.0]
+
+            # 检查nan
+            feat = [0.0 if np.isnan(f) or np.isinf(f) else f for f in feat]
             features.append(feat)
 
         features = np.array(features, dtype=np.float32)
+        features = np.nan_to_num(features, nan=0.0, posinf=0.0, neginf=0.0)
+
+        # 标准化
         from sklearn.preprocessing import StandardScaler
-        features = StandardScaler().fit_transform(features)
+        scaler = StandardScaler()
+
+        # 检查全0列
+        for col in range(features.shape[1]):
+            if np.std(features[:, col]) < 1e-6:
+                features[:, col] = np.random.randn(features.shape[0]) * 0.01
+
+        features = scaler.fit_transform(features)
+        features = np.nan_to_num(features, nan=0.0, posinf=0.0, neginf=0.0)
 
         return torch.tensor(features, dtype=torch.float)
 
     def _matrix_to_pyg(self, matrix, features, label):
-        """转换为PyG Data对象"""
+        """转换为PyG Data对象（添加 nan 处理）"""
+        # 确保矩阵无nan
+        matrix = np.nan_to_num(matrix, nan=0.0, posinf=0.0, neginf=0.0)
+
         edge_index = []
         edge_attr = []
 
         n = matrix.shape[0]
         for i in range(n):
             for j in range(i + 1, n):
-                if matrix[i, j] != 0:
+                weight = matrix[i, j]
+                # 检查权重
+                if np.isnan(weight) or np.isinf(weight):
+                    weight = 0.0
+
+                if weight != 0:
                     edge_index.extend([[i, j], [j, i]])
-                    edge_attr.extend([matrix[i, j], matrix[i, j]])
+                    edge_attr.extend([weight, weight])
+
+        # 如果没有边，添加自环
+        if len(edge_index) == 0:
+            for i in range(min(10, n)):
+                edge_index.extend([[i, i]])
+                edge_attr.extend([1.0])
 
         edge_index = torch.tensor(edge_index, dtype=torch.long).t()
         edge_attr = torch.tensor(edge_attr, dtype=torch.float)
+
+        # 再次检查
+        if torch.isnan(features).any():
+            features = torch.nan_to_num(features, nan=0.0, posinf=0.0, neginf=0.0)
+
+        if torch.isnan(edge_attr).any():
+            edge_attr = torch.nan_to_num(edge_attr, nan=0.0, posinf=0.0, neginf=0.0)
 
         return Data(
             x=features,
@@ -597,7 +722,6 @@ class ABIDEDualStream:
             edge_attr=edge_attr,
             y=torch.tensor([label], dtype=torch.long)
         )
-
 
 # 在ABIDEDataProcessor类中添加双流处理方法
 def process_dual_stream(self):

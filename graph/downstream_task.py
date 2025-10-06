@@ -674,7 +674,14 @@ class SF_DPL_Task(GraphTask):
     def __init__(self, dataset_name, shots, device, logger,
                  graph_method='correlation_matrix',
                  pretrain_task='GraphMAE',
-                 pretrain_source='same'):
+                 pretrain_source='same',
+                 # 新增可调参数
+                 num_layer=5,
+                 hidden_dim=128,
+                 drop_ratio=0.3,
+                 num_prompts=5,
+                 epochs=100,
+                 lr=0.001):
 
         self.dataset_name = dataset_name
         self.shots = shots
@@ -684,33 +691,53 @@ class SF_DPL_Task(GraphTask):
         self.pretrain_task = pretrain_task
         self.pretrain_source = pretrain_source
 
+        # 保存超参数
+        self.num_layer = num_layer
+        self.hidden_dim = hidden_dim
+        self.drop_ratio = drop_ratio
+        self.num_prompts = num_prompts
+        self.epochs = epochs
+        self.lr = lr
+
         # 加载双流数据
         self.load_dual_stream_data()
 
-        # 获取输入维度
+        # 获取输入维度（关键修改）
         sample_data = self.dual_stream_data[0]
-        input_dim = sample_data[0].x.shape[1]
+        struct_input_dim = sample_data[1].x.shape[1]  # 结构流维度
+        func_input_dim = sample_data[0].x.shape[1]  # 功能流维度
 
-        self.logger.info(f"检测到输入特征维度: {input_dim}")  # 添加日志
+        self.logger.info(f"检测到输入特征维度:")
+        self.logger.info(f"  结构流: {struct_input_dim}")
+        self.logger.info(f"  功能流: {func_input_dim}")
 
-        # 初始化SF-DPL模型
+        # 初始化SF-DPL模型（使用两个不同的输入维度）
         from sf_dpl_model import SF_DPL
 
         self.model = SF_DPL(
-            num_layer=5,
-            input_dim=input_dim,
-            hidden_dim=128,
+            num_layer=num_layer,
+            struct_input_dim=struct_input_dim,  # 结构流
+            func_input_dim=func_input_dim,  # 功能流
+            hidden_dim=hidden_dim,
             num_classes=2,
-            drop_ratio=0.3
+            drop_ratio=drop_ratio,
+            num_prompts=num_prompts
         ).to(device)
 
-        # 加载预训练权重（关键添加）
+        # 加载预训练权重
         self.load_pretrained_weights()
 
-        self.optimizer = torch.optim.Adam(self.model.parameters(), lr=0.001)
+        self.optimizer = torch.optim.Adam(self.model.parameters(), lr=lr)
+
+        # 打印模型信息
+        total_params = sum(p.numel() for p in self.model.parameters())
+        trainable_params = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
+        self.logger.info(f"模型参数统计:")
+        self.logger.info(f"  总参数量: {total_params:,}")
+        self.logger.info(f"  可训练参数: {trainable_params:,}")
 
     def load_pretrained_weights(self):
-        """加载预训练权重到双流编码器"""
+        """加载预训练权重到双流编码器（处理维度不匹配）"""
         if self.pretrain_task is None or self.pretrain_task == 'None':
             self.logger.info("不使用预训练模型")
             return
@@ -734,7 +761,7 @@ class SF_DPL_Task(GraphTask):
             pretrain_file = f'graphmae_{source}_for_{target}_{self.graph_method}.pth'
         elif self.pretrain_task == 'EdgePrediction':
             pretrain_dir = './pretrained_models/edge_prediction'
-            pretrain_file = f'edge_{source}_for_{target}_{self.graph_method}.pth'
+            pretrain_file = f'edge_prediction_{source}_for_{target}_{self.graph_method}.pth'
         else:
             self.logger.warning(f"未知的预训练任务: {self.pretrain_task}")
             return
@@ -758,24 +785,42 @@ class SF_DPL_Task(GraphTask):
         else:
             state_dict = checkpoint
 
-        # 提取encoder部分
+        # 提取encoder部分（排除第一层，因为输入维度可能不匹配）
         encoder_state = {}
         for k, v in state_dict.items():
+            # 跳过第一层卷积（输入层）
+            if 'convs.0' in k and ('mlp.0.weight' in k or 'mlp.0.bias' in k):
+                self.logger.info(f"跳过第一层权重（维度不匹配）: {k}")
+                continue
+
+            # 只保留encoder相关的权重
             if 'encoder' in k:
                 new_k = k.replace('encoder.', '')
                 encoder_state[new_k] = v
-            elif not any(x in k for x in ['decoder', 'classifier', 'prediction']):
+            elif not any(x in k for x in ['decoder', 'classifier', 'prediction', 'edge_pred']):
                 encoder_state[k] = v
 
-        # 加载到双流编码器
+        # 加载到双流编码器（使用strict=False允许部分加载）
         try:
             # 结构流编码器
-            self.model.struct_encoder.load_state_dict(encoder_state, strict=False)
-            self.logger.info("结构编码器加载预训练权重成功")
+            missing_keys, unexpected_keys = self.model.struct_encoder.load_state_dict(
+                encoder_state, strict=False
+            )
+            self.logger.info("结构编码器加载预训练权重:")
+            self.logger.info(f"  成功加载: {len(encoder_state) - len(missing_keys)} 个参数")
+            if missing_keys:
+                self.logger.info(f"  未匹配的键: {len(missing_keys)} 个（包括第一层）")
 
             # 功能流编码器
-            self.model.func_encoder.load_state_dict(encoder_state, strict=False)
-            self.logger.info("功能编码器加载预训练权重成功")
+            missing_keys, unexpected_keys = self.model.func_encoder.load_state_dict(
+                encoder_state, strict=False
+            )
+            self.logger.info("功能编码器加载预训练权重:")
+            self.logger.info(f"  成功加载: {len(encoder_state) - len(missing_keys)} 个参数")
+            if missing_keys:
+                self.logger.info(f"  未匹配的键: {len(missing_keys)} 个（包括第一层）")
+
+            self.logger.info("预训练权重加载完成（第一层保持随机初始化）")
 
         except Exception as e:
             self.logger.warning(f"加载预训练权重时出现警告: {e}")
@@ -823,11 +868,14 @@ class SF_DPL_Task(GraphTask):
         self.logger.info(f"测试样本: {len(self.test_data)}")
 
     def train_epoch(self):
-        """训练一个epoch"""
+        """训练一个epoch（添加梯度裁剪和nan检查）"""
         from torch_geometric.data import Batch
 
         self.model.train()
         total_loss = 0
+        total_ce_loss = 0
+        total_ortho_loss = 0
+        num_batches = 0
 
         # 批处理
         batch_size = 32
@@ -843,28 +891,59 @@ class SF_DPL_Task(GraphTask):
             func_batch = Batch.from_data_list(func_list).to(self.device)
             struct_batch = Batch.from_data_list(struct_list).to(self.device)
 
+            # 检查输入数据
+            if torch.isnan(func_batch.x).any() or torch.isnan(struct_batch.x).any():
+                self.logger.warning("检测到输入数据中有nan，跳过该batch")
+                continue
+
             # 前向传播
             self.optimizer.zero_grad()
             output, ortho_loss = self.model(struct_batch, func_batch)
 
+            # 检查输出
+            if torch.isnan(output).any():
+                self.logger.warning("检测到输出中有nan，跳过该batch")
+                continue
+
             # 损失
-            loss = F.cross_entropy(output, func_batch.y) + ortho_loss
+            ce_loss = F.cross_entropy(output, func_batch.y)
+            loss = ce_loss + ortho_loss
+
+            # 检查损失
+            if torch.isnan(loss):
+                self.logger.warning("检测到损失为nan，跳过该batch")
+                continue
 
             loss.backward()
+
+            # 梯度裁剪（防止梯度爆炸）
+            torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+
             self.optimizer.step()
 
             total_loss += loss.item()
+            total_ce_loss += ce_loss.item()
+            total_ortho_loss += ortho_loss.item()
+            num_batches += 1
 
-        return total_loss / (len(self.train_data) // batch_size + 1)
+        if num_batches == 0:
+            return 0, 0, 0
+
+        return (total_loss / num_batches,
+                total_ce_loss / num_batches,
+                total_ortho_loss / num_batches)
 
     def evaluate(self):
-        """评估"""
+        """评估（返回多个指标）"""
         from torch_geometric.data import Batch
-        from sklearn.metrics import accuracy_score
+        from sklearn.metrics import accuracy_score, f1_score, roc_auc_score, precision_score, recall_score
 
         self.model.eval()
         all_preds = []
+        all_probs = []
         all_labels = []
+        total_loss = 0
+        num_batches = 0
 
         with torch.no_grad():
             batch_size = 32
@@ -877,31 +956,95 @@ class SF_DPL_Task(GraphTask):
                 func_batch = Batch.from_data_list(func_list).to(self.device)
                 struct_batch = Batch.from_data_list(struct_list).to(self.device)
 
-                output, _ = self.model(struct_batch, func_batch)
+                output, ortho_loss = self.model(struct_batch, func_batch)
+
+                # 检查nan
+                if torch.isnan(output).any():
+                    continue
+
+                loss = F.cross_entropy(output, func_batch.y) + ortho_loss
+                total_loss += loss.item()
+                num_batches += 1
+
+                probs = F.softmax(output, dim=1)
                 preds = output.argmax(dim=1)
 
                 all_preds.extend(preds.cpu().numpy())
+                all_probs.extend(probs[:, 1].cpu().numpy())
                 all_labels.extend(func_batch.y.cpu().numpy())
 
-        acc = accuracy_score(all_labels, all_preds)
-        return acc
+        # 计算各种指标
+        all_preds = np.array(all_preds)
+        all_probs = np.array(all_probs)
+        all_labels = np.array(all_labels)
+
+        metrics = {}
+        metrics['loss'] = total_loss / num_batches if num_batches > 0 else 0
+        metrics['accuracy'] = accuracy_score(all_labels, all_preds)
+        metrics['f1'] = f1_score(all_labels, all_preds, average='binary', zero_division=0)
+        metrics['precision'] = precision_score(all_labels, all_preds, average='binary', zero_division=0)
+        metrics['recall'] = recall_score(all_labels, all_preds, average='binary', zero_division=0)
+
+        # AUC（需要至少两个类别）
+        if len(np.unique(all_labels)) > 1:
+            try:
+                metrics['auc'] = roc_auc_score(all_labels, all_probs)
+            except:
+                metrics['auc'] = 0.0
+        else:
+            metrics['auc'] = 0.0
+
+        return metrics
 
     def run(self, epochs=100):
-        """运行训练和评估"""
+        """运行训练和评估（改进的日志输出）"""
         best_acc = 0
+        best_f1 = 0
+        best_epoch = 0
+
+        self.logger.info("\n" + "=" * 80)
+        self.logger.info("开始训练SF-DPL模型")
+        self.logger.info("=" * 80)
 
         for epoch in range(epochs):
-            train_loss = self.train_epoch()
+            # 训练
+            train_loss, train_ce_loss, train_ortho_loss = self.train_epoch()
 
-            if epoch % 10 == 0:
-                test_acc = self.evaluate()
-                self.logger.info(f"Epoch {epoch}: Loss={train_loss:.4f}, Acc={test_acc:.4f}")
+            # 评估
+            if epoch % 1 == 0:  # 每5个epoch评估一次
+                test_metrics = self.evaluate()
 
-                if test_acc > best_acc:
-                    best_acc = test_acc
+                # 更新最佳结果
+                if test_metrics['accuracy'] > best_acc:
+                    best_acc = test_metrics['accuracy']
+                    best_epoch = epoch
 
-        self.logger.info(f"Best Accuracy: {best_acc:.4f}")
-        return best_acc
+                if test_metrics['f1'] > best_f1:
+                    best_f1 = test_metrics['f1']
+
+                # 格式化日志输出
+                log_info = ''.join([
+                    '| epoch: {:4d} '.format(epoch),
+                    '| train_loss: {:7.5f} '.format(train_loss),
+                    '| train_ce: {:7.5f} '.format(train_ce_loss),
+                    '| train_ortho: {:7.5f} '.format(train_ortho_loss),
+                    '| test_loss: {:7.5f} '.format(test_metrics['loss']),
+                    '| test_acc: {:7.5f} '.format(test_metrics['accuracy']),
+                    '| test_f1: {:7.5f} '.format(test_metrics['f1']),
+                    '| test_auc: {:7.5f} '.format(test_metrics['auc']),
+                    '| test_prec: {:7.5f} '.format(test_metrics['precision']),
+                    '| test_recall: {:7.5f} '.format(test_metrics['recall']),
+                    '| best_acc: {:7.5f} |'.format(best_acc)
+                ])
+
+                self.logger.info(log_info)
+
+        self.logger.info("\n" + "=" * 80)
+        self.logger.info(f"训练完成！最佳准确率: {best_acc:.4f} (Epoch {best_epoch})")
+        self.logger.info(f"最佳F1分数: {best_f1:.4f}")
+        self.logger.info("=" * 80)
+
+        return best_acc, best_f1
 
 def set_random_seed(seed):
     """设置随机种子"""
@@ -1008,28 +1151,98 @@ if __name__ == '__main__':
 
     # 添加SF-DPL特定参数
     parser.add_argument('--use_sf_dpl', action='store_true', help='使用SF-DPL方法')
+    parser.add_argument('--drop_ratio', type=float, default=0.3, help='Dropout比率')
+    parser.add_argument('--lr', type=float, default=0.001, help='学习率')
+    # 添加多seed支持
+    parser.add_argument('--num_seeds', type=int, default=5, help='运行多少个不同的随机种子')
+    parser.add_argument('--start_seed', type=int, default=0, help='起始随机种子')
 
     args = parser.parse_args()
 
     if args.use_sf_dpl:
-        # 运行SF-DPL
-        print("\n运行SF-DPL实验...")
-        from logger import Logger
+        # 打印实验配置
+        print("\n" + "=" * 80)
+        print("SF-DPL实验配置")
+        print("=" * 80)
+        for key, value in vars(args).items():
+            print(f"{key:20s}: {value}")
+        print("=" * 80 + "\n")
 
-        logger = Logger('sf_dpl.log', None)
-        task = SF_DPL_Task(args.dataset_name, args.shots,
-                           torch.device(f'cuda:{args.gpu_id}'), logger)
-        acc = task.run(epochs=args.epochs)
+        # 运行多个seed
+        all_results_acc = []
+        all_results_f1 = []
 
-        print(f"\nSF-DPL 最终准确率: {acc:.4f}")
+        for seed_idx in range(args.num_seeds):
+            seed = args.start_seed + seed_idx
 
-        # 保存结果
+            print(f"\n{'=' * 80}")
+            print(f"运行 Seed {seed} ({seed_idx + 1}/{args.num_seeds})")
+            print(f"{'=' * 80}")
+
+            # 设置随机种子
+            set_random_seed(seed)
+
+            # 创建logger
+            log_dir = os.path.join('log', args.dataset_name, 'sf_dpl')
+            os.makedirs(log_dir, exist_ok=True)
+            log_file = os.path.join(log_dir,
+                                    f'{args.dataset_name}_{args.shots}shot_{args.pretrain_source}_{seed}.log')
+
+            formatter = logging.Formatter('%(asctime)s - %(message)s')
+            logger = Logger(log_file, formatter)
+
+            # 创建任务
+            task = SF_DPL_Task(
+                args.dataset_name,
+                args.shots,
+                torch.device(f'cuda:{args.gpu_id}' if torch.cuda.is_available() else 'cpu'),
+                logger,
+                graph_method=args.graph_method,
+                pretrain_task=args.pretrain_task,
+                pretrain_source=args.pretrain_source,
+                num_layer=args.num_layer,
+                hidden_dim=args.hidden_dim,
+                drop_ratio=args.drop_ratio,
+                num_prompts=args.num_prompts,
+                epochs=args.epochs,
+                lr=args.lr
+            )
+
+            # 训练
+            acc, f1 = task.run(epochs=args.epochs)
+            all_results_acc.append(acc)
+            all_results_f1.append(f1)
+
+            print(f"\nSeed {seed} 结果: Accuracy = {acc:.4f}, F1 = {f1:.4f}")
+
+        # 计算统计结果
+        mean_acc = np.mean(all_results_acc)
+        std_acc = np.std(all_results_acc)
+        mean_f1 = np.mean(all_results_f1)
+        std_f1 = np.std(all_results_f1)
+
+        # 打印最终结果
+        print(f"\n{'=' * 80}")
+        print(f"最终结果 ({args.dataset_name} - SF-DPL - {args.shots}shot - {args.pretrain_source})")
+        print(f"{'=' * 80}")
+        print(f"准确率: {mean_acc:.4f} ± {std_acc:.4f}")
+        print(f"F1分数: {mean_f1:.4f} ± {std_f1:.4f}")
+        print(f"{'=' * 80}\n")
+
+        # 保存结果到文件
         result_dir = os.path.join('results', args.dataset_name)
         os.makedirs(result_dir, exist_ok=True)
 
-        with open(os.path.join(result_dir, 'sf_dpl_results.txt'), 'a') as f:
-            f.write(f"{args.dataset_name} {args.shots} SF-DPL: Acc={acc:.4f}\n")
-
+        result_file = os.path.join(result_dir, 'sf_dpl_results.txt')
+        with open(result_file, 'a') as f:
+            f.write(f"\n{'-' * 80}\n")
+            f.write(f"Dataset: {args.dataset_name}\n")
+            f.write(f"Shots: {args.shots}\n")
+            f.write(f"Pretrain: {args.pretrain_task} ({args.pretrain_source})\n")
+            f.write(f"Hidden_dim: {args.hidden_dim}, Num_prompts: {args.num_prompts}\n")
+            f.write(f"Accuracy: {mean_acc:.4f} ± {std_acc:.4f}\n")
+            f.write(f"F1 Score: {mean_f1:.4f} ± {std_f1:.4f}\n")
+            f.write(f"Individual results: {[f'{acc:.4f}' for acc in all_results_acc]}\n")
     else:
         # 打印实验配置
         print("\n" + "=" * 60)

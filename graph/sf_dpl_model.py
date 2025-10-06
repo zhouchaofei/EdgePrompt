@@ -5,7 +5,7 @@ Structure-Function Decoupled Prompt Learning (SF-DPL) Model
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch_geometric.nn import GCNConv, global_mean_pool
+from torch_geometric.nn import global_mean_pool
 from model import GIN
 
 
@@ -84,30 +84,43 @@ class FunctionPrompt(nn.Module):
 
 
 class SF_DPL(nn.Module):
-    """结构-功能解耦提示学习模型"""
+    """
+    结构-功能解耦提示学习模型
 
-    def __init__(self, num_layer=5, input_dim=12, hidden_dim=128,
-                 num_classes=2, drop_ratio=0.3):
+    核心思想：
+    1. 双流架构：分别处理结构连接和功能动态
+    2. 解耦机制：通过正交化损失确保两种特征互补
+    3. 提示学习：只微调少量参数，保护预训练知识
+    """
+
+    def __init__(self,
+                 num_layer=5,
+                 struct_input_dim=4,      # 修改：结构流输入维度
+                 func_input_dim=10,       # 修改：功能流输入维度
+                 hidden_dim=128,
+                 num_classes=2,
+                 drop_ratio=0.3,
+                 num_prompts=5):
         super().__init__()
 
-        # 双流GNN编码器
+        # 双流GNN编码器（不同输入维度）
         self.struct_encoder = GIN(
             num_layer=num_layer,
-            input_dim=input_dim,
+            input_dim=struct_input_dim,  # 结构流维度
             hidden_dim=hidden_dim,
             drop_ratio=drop_ratio
         )
 
         self.func_encoder = GIN(
             num_layer=num_layer,
-            input_dim=input_dim,
+            input_dim=func_input_dim,    # 功能流维度
             hidden_dim=hidden_dim,
             drop_ratio=drop_ratio
         )
 
         # 提示模块
-        self.struct_prompt = StructurePrompt(hidden_dim)
-        self.func_prompt = FunctionPrompt(hidden_dim)
+        self.struct_prompt = StructurePrompt(hidden_dim, num_prompts)
+        self.func_prompt = FunctionPrompt(hidden_dim, num_prompts)
 
         # 正交化损失权重
         self.ortho_weight = 0.01
@@ -146,15 +159,33 @@ class SF_DPL(nn.Module):
         return logits, ortho_loss
 
     def compute_orthogonality_loss(self, feat1, feat2):
-        """计算正交化损失，确保两个特征解耦"""
-        # 归一化
-        feat1_norm = F.normalize(feat1, p=2, dim=1)
-        feat2_norm = F.normalize(feat2, p=2, dim=1)
+        """
+        计算正交化损失，确保两个特征解耦
+
+        原理：
+        - 通过最小化余弦相似度，迫使结构和功能特征学习正交的信息
+        - 这确保了两个流捕获互补而非冗余的特征
+        """
+        # 检查输入是否有nan
+        if torch.isnan(feat1).any() or torch.isnan(feat2).any():
+            return torch.tensor(0.0, device=feat1.device)
+
+        # 归一化（添加epsilon避免除零）
+        feat1_norm = F.normalize(feat1, p=2, dim=1, eps=1e-8)
+        feat2_norm = F.normalize(feat2, p=2, dim=1, eps=1e-8)
 
         # 计算余弦相似度
         similarity = torch.matmul(feat1_norm, feat2_norm.t())
 
+        # 检查相似度是否有nan
+        if torch.isnan(similarity).any():
+            return torch.tensor(0.0, device=feat1.device)
+
         # 正交化损失（相似度应该接近0）
         ortho_loss = torch.abs(similarity).mean()
+
+        # 再次检查
+        if torch.isnan(ortho_loss):
+            return torch.tensor(0.0, device=feat1.device)
 
         return ortho_loss * self.ortho_weight

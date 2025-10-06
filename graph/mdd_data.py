@@ -11,8 +11,10 @@ import nibabel as nib
 from sklearn.preprocessing import StandardScaler
 from scipy import stats
 from scipy import signal
+import scipy.io as sio
 import warnings
 import glob
+import re
 
 warnings.filterwarnings('ignore')
 
@@ -29,7 +31,7 @@ class MDDDataProcessor:
         self.data_folder = data_folder
         self.connectivity_kind = connectivity_kind
         self.threshold = threshold
-        self.mdd_path = os.path.join(data_folder, 'REST-meta-MDD')  # 修改为正确的文件夹名
+        self.mdd_path = os.path.join(data_folder, 'REST-meta-MDD')
         self.processed_path = os.path.join(self.mdd_path, 'processed')
 
         # 创建必要的目录
@@ -50,93 +52,141 @@ class MDDDataProcessor:
 
         # ROISignals文件夹路径
         results_path = os.path.join(self.mdd_path, 'Results')
-        roi_folders = [
-            'ROISignals_FunImgARCWF',
-            'ROISignals_FunImgARglobalCWF'
-        ]
+        roi_folder = 'ROISignals_FunImgARCWF'  # 使用不含全局信号回归的版本
 
-        # 为不同文件夹分配标签（0: 健康对照, 1: MDD患者）
-        # 注意：这里需要根据实际的数据组织调整
-        folder_labels = {
-            'ROISignals_FunImgARCWF': 0,  # 假设为健康对照
-            'ROISignals_FunImgARglobalCWF': 1  # 假设为MDD患者
-        }
+        folder_path = os.path.join(results_path, roi_folder)
 
-        for folder_name in roi_folders:
-            folder_path = os.path.join(results_path, folder_name)
+        if not os.path.exists(folder_path):
+            print(f"未找到ROI文件夹: {folder_path}")
+            return data_dict
 
-            if os.path.exists(folder_path):
-                print(f"处理文件夹: {folder_path}")
+        print(f"处理文件夹: {folder_path}")
 
-                # 查找所有的ROI信号文件（可能是.txt, .csv, .mat等格式）
-                roi_files = glob.glob(os.path.join(folder_path, '*'))
-                print(f"找到 {len(roi_files)} 个文件")
+        # 统计标签分布
+        label_stats = {'MDD': 0, 'HC': 0, 'unknown': 0, 'error': 0}
 
-                for file_path in roi_files:
-                    try:
-                        subject_id = os.path.basename(file_path).split('.')[0]
+        # 直接递归搜索所有.mat文件
+        roi_files = glob.glob(os.path.join(folder_path, '**', '*.mat'), recursive=True)
 
-                        # 根据文件扩展名选择加载方法
-                        if file_path.endswith('.txt') or file_path.endswith('.csv'):
-                            # 文本文件格式
-                            time_series = np.loadtxt(file_path)
-                        elif file_path.endswith('.mat'):
-                            # MATLAB文件格式
-                            import scipy.io as sio
-                            mat_data = sio.loadmat(file_path)
-                            # 需要找到包含时间序列的变量名
-                            for key in mat_data.keys():
-                                if not key.startswith('__'):
-                                    time_series = mat_data[key]
-                                    break
-                        elif file_path.endswith('.nii.gz') or file_path.endswith('.nii'):
-                            # NIfTI格式
-                            img = nib.load(file_path)
-                            time_series = img.get_fdata()
-                        else:
-                            continue
+        print(f"找到 {len(roi_files)} 个.mat文件")
 
-                        # 确保数据是2D的 (time_points, n_regions)
-                        if len(time_series.shape) == 1:
-                            time_series = time_series.reshape(-1, 1)
-                        elif len(time_series.shape) > 2:
-                            # 如果是高维数据，尝试reshape
-                            time_series = time_series.reshape(time_series.shape[0], -1)
+        if len(roi_files) == 0:
+            print("警告: 未找到任何.mat文件")
+            return data_dict
 
-                        # 检查时间序列的有效性
-                        if time_series.shape[0] < 50:  # 时间点太少
-                            print(f"  跳过 {subject_id}: 时间点太少 ({time_series.shape[0]})")
-                            continue
+        for file_idx, file_path in enumerate(roi_files):
+            try:
+                filename = os.path.basename(file_path)
 
-                        if time_series.shape[1] < 10:  # ROI太少
-                            print(f"  跳过 {subject_id}: ROI太少 ({time_series.shape[1]})")
-                            continue
+                # ===== 关键：从文件名提取标签 =====
+                # 文件名格式: ROISignals_S1-1-0001.mat
+                # -1- 表示MDD患者，-2- 表示健康对照
 
-                        # 标准化到合理的ROI数量（如116个AAL ROI）
-                        if time_series.shape[1] > 116:
-                            time_series = time_series[:, :116]
+                match = re.search(r'-(\d)-', filename)
 
-                        data_dict['time_series'].append(time_series)
-                        data_dict['labels'].append(folder_labels.get(folder_name, 0))
-                        data_dict['subject_ids'].append(subject_id)
-                        data_dict['file_paths'].append(file_path)
+                if not match:
+                    if file_idx < 5:  # 只打印前几个
+                        print(f"  跳过: 无法从文件名提取标签 {filename}")
+                    label_stats['unknown'] += 1
+                    continue
 
-                        print(f"  成功加载 {subject_id}: {time_series.shape}")
+                group_code = int(match.group(1))
 
-                    except Exception as e:
-                        print(f"  处理文件 {os.path.basename(file_path)} 时出错: {e}")
-                        continue
+                if group_code == 1:
+                    label = 1  # MDD患者
+                    label_stats['MDD'] += 1
+                elif group_code == 2:
+                    label = 0  # 健康对照
+                    label_stats['HC'] += 1
+                else:
+                    if file_idx < 5:
+                        print(f"  跳过: 未知的组别代码 {group_code} in {filename}")
+                    label_stats['unknown'] += 1
+                    continue
 
-        print(f"\n成功加载 {len(data_dict['time_series'])} 个被试数据")
+                # ===== 加载.mat文件 =====
+                mat_data = sio.loadmat(file_path)
+
+                # 查找时间序列数据
+                time_series = None
+                for key in mat_data.keys():
+                    if not key.startswith('__'):
+                        data = mat_data[key]
+                        if isinstance(data, np.ndarray) and data.ndim == 2:
+                            time_series = data
+                            break
+
+                if time_series is None:
+                    label_stats['error'] += 1
+                    continue
+
+                # 确保维度正确 (time_points, n_regions)
+                if time_series.shape[1] > time_series.shape[0]:
+                    time_series = time_series.T
+
+                # 检查时间序列的有效性
+                if time_series.shape[0] < 50:
+                    label_stats['error'] += 1
+                    continue
+
+                if time_series.shape[1] < 10:
+                    label_stats['error'] += 1
+                    continue
+
+                # 标准化到116个ROI（AAL模板）
+                if time_series.shape[1] > 116:
+                    time_series = time_series[:, :116]
+                elif time_series.shape[1] < 116:
+                    padding = np.zeros((time_series.shape[0], 116 - time_series.shape[1]))
+                    time_series = np.concatenate([time_series, padding], axis=1)
+
+                # 提取被试ID
+                subject_id = filename.split('.')[0]
+
+                # 保存数据
+                data_dict['time_series'].append(time_series)
+                data_dict['labels'].append(label)
+                data_dict['subject_ids'].append(subject_id)
+                data_dict['file_paths'].append(file_path)
+
+                # 定期输出进度
+                if (file_idx + 1) % 50 == 0:
+                    print(f"  已处理 {file_idx + 1}/{len(roi_files)} 个文件")
+
+            except Exception as e:
+                label_stats['error'] += 1
+                if file_idx < 5:  # 只打印前几个错误
+                    print(f"  处理文件 {os.path.basename(file_path)} 时出错: {e}")
+                continue
+
+        # 打印统计信息
+        print(f"\n{'='*60}")
+        print(f"数据加载完成统计:")
+        print(f"{'='*60}")
+        print(f"成功加载: {len(data_dict['time_series'])} 个被试")
+        print(f"  - MDD患者 (标签1): {label_stats['MDD']}")
+        print(f"  - 健康对照 (标签0): {label_stats['HC']}")
+        print(f"  - 无法识别标签: {label_stats['unknown']}")
+        print(f"  - 处理错误: {label_stats['error']}")
+
+        # 验证标签平衡性
+        if label_stats['MDD'] > 0 and label_stats['HC'] > 0:
+            ratio = max(label_stats['MDD'], label_stats['HC']) / min(label_stats['MDD'], label_stats['HC'])
+            print(f"\n类别比例: {ratio:.2f}:1", end=" ")
+            if ratio > 3:
+                print("(类别不平衡)")
+            else:
+                print("(分布合理)")
+
         return data_dict
 
     def load_phenotypic_data(self):
         """
         加载表型数据（如果存在）
         """
-        phenotypic_path = os.path.join(self.mdd_path, 'phenotypic.csv')
+        phenotypic_path = os.path.join(self.mdd_path, 'Demographic_Data.xlsx')
         if os.path.exists(phenotypic_path):
-            phenotypic = pd.read_csv(phenotypic_path)
+            phenotypic = pd.read_excel(phenotypic_path)
             print(f"加载表型数据: {phenotypic.shape}")
             return phenotypic
         return None
@@ -314,10 +364,10 @@ class MDDDataProcessor:
                 graph_list.append(data_obj)
 
                 if (idx + 1) % 10 == 0:
-                    print(f"已处理 {idx + 1}/{len(data_dict['time_series'])} 个被试")
+                    print(f"  已处理 {idx + 1}/{len(data_dict['time_series'])} 个被试")
 
             except Exception as e:
-                print(f"处理被试 {idx} 时出错: {e}")
+                print(f"  处理被试 {idx} 时出错: {e}")
                 continue
 
         print(f"\n成功构建 {len(graph_list)} 个脑功能图")
@@ -369,7 +419,7 @@ class MDDDataProcessor:
             data_dict['time_series'].append(time_series)
             data_dict['labels'].append(label)
             data_dict['subject_ids'].append(f'subj_{i:04d}')
-            data_dict['file_paths'].append(f'mock_file_{i:04d}.nii.gz')
+            data_dict['file_paths'].append(f'mock_file_{i:04d}.mat')
 
         return data_dict
 
@@ -387,25 +437,6 @@ class MDDDataProcessor:
             return self.process_and_save(graph_method=graph_method)
 
 
-def load_mdd_data(data_folder='./data', graph_method='correlation_matrix'):
-    """
-    便捷函数：加载MDD数据集
-    """
-    processor = MDDDataProcessor(data_folder=data_folder)
-
-    # 尝试加载已处理的数据
-    graph_list = processor.load_processed_data(graph_method=graph_method)
-
-    if graph_list:
-        input_dim = graph_list[0].x.shape[1]
-        output_dim = 2  # 二分类任务
-    else:
-        input_dim = 0
-        output_dim = 2
-
-    return graph_list, input_dim, output_dim
-
-
 class MDDDualStream:
     """MDD双流数据处理扩展"""
 
@@ -421,67 +452,126 @@ class MDDDualStream:
             print(f"请下载REST-meta-MDD到: {mdd_path}")
             return []
 
-        # 加载人口学数据
-        demo_file = os.path.join(mdd_path, 'Demographic_Data.xlsx')
-        if os.path.exists(demo_file):
-            demographics = pd.read_excel(demo_file)
-        else:
-            demographics = None
-
         dual_stream_data = []
 
-        # 遍历站点
-        sites = [d for d in os.listdir(roi_path)
-                 if os.path.isdir(os.path.join(roi_path, d))]
+        # 统计标签分布
+        label_stats = {'MDD': 0, 'HC': 0, 'unknown': 0, 'error': 0}
 
-        for site in sites:
-            site_path = os.path.join(roi_path, site)
-            roi_files = glob.glob(os.path.join(site_path, '*.txt'))
+        # 直接递归搜索所有.mat文件
+        roi_files = glob.glob(os.path.join(roi_path, '**', '*.mat'), recursive=True)
 
-            for roi_file in roi_files:
-                try:
-                    # 加载时间序列
-                    time_series = np.loadtxt(roi_file)
+        print(f"找到 {len(roi_files)} 个.mat文件")
 
-                    if time_series.shape[0] < 50:
-                        continue
+        if len(roi_files) == 0:
+            print("警告: 未找到任何.mat文件")
+            return []
 
-                    # 确保维度正确
-                    if time_series.shape[1] > time_series.shape[0]:
-                        time_series = time_series.T
+        for file_idx, roi_file in enumerate(roi_files):
+            try:
+                filename = os.path.basename(roi_file)
 
-                    # 标准化到116个ROI
-                    if time_series.shape[1] != 116:
-                        if time_series.shape[1] > 116:
-                            time_series = time_series[:, :116]
-                        else:
-                            padding = np.zeros((time_series.shape[0], 116 - time_series.shape[1]))
-                            time_series = np.concatenate([time_series, padding], axis=1)
+                # ===== 关键：从文件名提取标签 =====
+                # 格式: ROISignals_S1-1-0001.mat
+                # -1- 表示MDD患者，-2- 表示健康对照
 
-                    # 获取标签（简化：从文件名判断）
-                    filename = os.path.basename(roi_file)
-                    label = 1 if 'MDD' in filename.upper() else 0
+                match = re.search(r'-(\d)-', filename)
 
-                    # 构建双流
-                    func_data, struct_data = self.construct_mdd_dual_stream(
-                        time_series, label
-                    )
-                    dual_stream_data.append((func_data, struct_data))
-
-                except Exception as e:
+                if not match:
+                    label_stats['unknown'] += 1
                     continue
 
-        print(f"加载了{len(dual_stream_data)}个MDD双流样本")
+                group_code = int(match.group(1))
+
+                if group_code == 1:
+                    label = 1  # MDD患者
+                    label_stats['MDD'] += 1
+                elif group_code == 2:
+                    label = 0  # 健康对照
+                    label_stats['HC'] += 1
+                else:
+                    label_stats['unknown'] += 1
+                    continue
+
+                # 加载.mat文件
+                mat_data = sio.loadmat(roi_file)
+
+                # 找到时间序列数据
+                time_series = None
+                for key in mat_data.keys():
+                    if not key.startswith('__'):
+                        data = mat_data[key]
+                        if isinstance(data, np.ndarray) and data.ndim == 2:
+                            time_series = data
+                            break
+
+                if time_series is None:
+                    label_stats['error'] += 1
+                    continue
+
+                # 确保维度正确
+                if time_series.shape[1] > time_series.shape[0]:
+                    time_series = time_series.T
+
+                if time_series.shape[0] < 50:
+                    label_stats['error'] += 1
+                    continue
+
+                # 标准化到116个ROI
+                if time_series.shape[1] != 116:
+                    if time_series.shape[1] > 116:
+                        time_series = time_series[:, :116]
+                    else:
+                        padding = np.zeros((time_series.shape[0], 116 - time_series.shape[1]))
+                        time_series = np.concatenate([time_series, padding], axis=1)
+
+                # 构建双流
+                func_data, struct_data = self.construct_mdd_dual_stream(
+                    time_series, label
+                )
+                dual_stream_data.append((func_data, struct_data))
+
+                # 定期输出进度
+                if (file_idx + 1) % 50 == 0:
+                    print(f"  已处理 {file_idx + 1}/{len(roi_files)} 个文件")
+
+            except Exception as e:
+                label_stats['error'] += 1
+                if file_idx < 5:
+                    print(f"  处理文件 {os.path.basename(roi_file)} 时出错: {e}")
+                continue
+
+        # 打印统计信息
+        print(f"\n{'='*60}")
+        print(f"双流数据构建完成:")
+        print(f"{'='*60}")
+        print(f"成功构建: {len(dual_stream_data)} 个双流样本")
+        print(f"  - MDD患者 (标签1): {label_stats['MDD']}")
+        print(f"  - 健康对照 (标签0): {label_stats['HC']}")
+        print(f"  - 无法识别: {label_stats['unknown']}")
+        print(f"  - 处理错误: {label_stats['error']}")
+
+        # 验证标签平衡性
+        if label_stats['MDD'] > 0 and label_stats['HC'] > 0:
+            ratio = max(label_stats['MDD'], label_stats['HC']) / min(label_stats['MDD'], label_stats['HC'])
+            print(f"\n类别比例: {ratio:.2f}:1", end=" ")
+            if ratio > 3:
+                print("(类别不平衡)")
+            else:
+                print("(分布合理)")
 
         # 保存
         save_path = os.path.join(self.processor.processed_path, 'mdd_dual_stream.pt')
         torch.save(dual_stream_data, save_path)
+        print(f"\n数据已保存至: {save_path}")
 
         return dual_stream_data
 
     def construct_mdd_dual_stream(self, time_series, label):
-        """MDD特定的双流构建"""
-        # 功能流：关注动态变化（MDD情绪波动）
+        """MDD特定的双流构建（添加 nan 处理）"""
+        # 预处理：确保无 nan
+        time_series = np.nan_to_num(time_series, nan=0.0, posinf=0.0, neginf=0.0)
+
+        # 功能流：关注动态变化
         func_matrix = self._construct_mdd_functional(time_series)
 
         # 结构流
@@ -498,17 +588,29 @@ class MDDDualStream:
         return func_data, struct_data
 
     def _construct_mdd_functional(self, time_series):
-        """MDD功能网络：强调动态"""
+        """MDD功能网络：强调动态（添加 nan 处理）"""
+        # 预处理
+        time_series = np.nan_to_num(time_series, nan=0.0, posinf=0.0, neginf=0.0)
+
+        # 检查是否有全0列
+        for col in range(time_series.shape[1]):
+            if np.std(time_series[:, col]) < 1e-6:
+                time_series[:, col] = np.random.randn(time_series.shape[0]) * 0.01
+
         # 动态连接
         dynamic_conn = self._compute_dynamic_connectivity(time_series)
 
         # 标准相关
-        corr = np.corrcoef(time_series.T)
-        corr = np.nan_to_num(corr, 0)
-        np.fill_diagonal(corr, 0)
+        try:
+            corr = np.corrcoef(time_series.T)
+            corr = np.nan_to_num(corr, nan=0.0, posinf=0.0, neginf=0.0)
+            np.fill_diagonal(corr, 0)
+        except:
+            corr = np.zeros((time_series.shape[1], time_series.shape[1]))
 
         # 融合（MDD强调动态）
         func_matrix = (corr + dynamic_conn * 2) / 3
+        func_matrix = np.nan_to_num(func_matrix, nan=0.0, posinf=0.0, neginf=0.0)
 
         # 阈值化
         threshold = np.percentile(np.abs(func_matrix), 70)
@@ -517,9 +619,12 @@ class MDDDualStream:
         return func_matrix
 
     def _compute_dynamic_connectivity(self, time_series, window_size=30):
-        """计算动态连接"""
+        """计算动态连接（添加 nan 处理）"""
         n_regions = time_series.shape[1]
         n_windows = (time_series.shape[0] - window_size) // 10 + 1
+
+        if n_windows < 2:
+            return np.zeros((n_regions, n_regions))
 
         dynamic_matrices = []
         for w in range(n_windows):
@@ -528,20 +633,47 @@ class MDDDualStream:
             if end > time_series.shape[0]:
                 break
 
-            window_corr = np.corrcoef(time_series[start:end].T)
-            window_corr = np.nan_to_num(window_corr, 0)
-            dynamic_matrices.append(window_corr)
+            try:
+                window_ts = time_series[start:end]
+                window_ts = np.nan_to_num(window_ts, nan=0.0, posinf=0.0, neginf=0.0)
+
+                # 检查窗口内是否有常数列
+                valid = True
+                for col in range(window_ts.shape[1]):
+                    if np.std(window_ts[:, col]) < 1e-6:
+                        valid = False
+                        break
+
+                if not valid:
+                    continue
+
+                window_corr = np.corrcoef(window_ts.T)
+                window_corr = np.nan_to_num(window_corr, nan=0.0, posinf=0.0, neginf=0.0)
+                dynamic_matrices.append(window_corr)
+            except:
+                continue
 
         if len(dynamic_matrices) > 1:
-            # 返回标准差（变异性）
-            return np.std(dynamic_matrices, axis=0)
+            result = np.std(dynamic_matrices, axis=0)
+            result = np.nan_to_num(result, nan=0.0, posinf=0.0, neginf=0.0)
+            return result
         else:
             return np.zeros((n_regions, n_regions))
 
     def _construct_mdd_structural(self, time_series):
-        """MDD结构网络"""
-        corr = np.corrcoef(time_series.T)
-        corr = np.nan_to_num(corr, 0)
+        """MDD结构网络（添加 nan 处理）"""
+        time_series = np.nan_to_num(time_series, nan=0.0, posinf=0.0, neginf=0.0)
+
+        # 检查全0列
+        for col in range(time_series.shape[1]):
+            if np.std(time_series[:, col]) < 1e-6:
+                time_series[:, col] = np.random.randn(time_series.shape[0]) * 0.01
+
+        try:
+            corr = np.corrcoef(time_series.T)
+            corr = np.nan_to_num(corr, nan=0.0, posinf=0.0, neginf=0.0)
+        except:
+            corr = np.zeros((time_series.shape[1], time_series.shape[1]))
 
         # 强连接作为结构
         threshold = np.percentile(np.abs(corr), 95)
@@ -552,49 +684,145 @@ class MDDDualStream:
         return struct
 
     def _extract_mdd_functional_features(self, time_series):
-        """MDD功能特征"""
+        """MDD功能特征（添加 nan 处理）"""
         features = []
 
         for i in range(time_series.shape[1]):
             ts = time_series[:, i]
-            feat = [
-                np.mean(ts), np.std(ts),
-                stats.skew(ts), stats.kurtosis(ts),
-                np.ptp(ts)  # 范围（情绪波动）
-            ]
 
-            # MDD相关的低频振荡
-            freqs, psd = signal.welch(ts, fs=0.5, nperseg=min(len(ts), 64))
-            # Slow-5 and Slow-4
-            idx = (freqs >= 0.01) & (freqs <= 0.073)
-            feat.append(np.mean(psd[idx]) if np.any(idx) else 0)
+            # 检查并处理nan值
+            if np.isnan(ts).any():
+                ts = np.nan_to_num(ts, nan=0.0, posinf=0.0, neginf=0.0)
 
+            # 如果整个时间序列都是0或常数
+            if np.std(ts) < 1e-6:
+                ts = ts + np.random.randn(len(ts)) * 0.01
+
+            try:
+                feat = [
+                    np.mean(ts),
+                    np.std(ts) if np.std(ts) > 0 else 1e-6,
+                    stats.skew(ts) if not np.isnan(stats.skew(ts)) else 0.0,
+                    stats.kurtosis(ts) if not np.isnan(stats.kurtosis(ts)) else 0.0,
+                    np.ptp(ts) if np.ptp(ts) > 0 else 1e-6
+                ]
+
+                # MDD相关的低频振荡
+                try:
+                    freqs, psd = signal.welch(ts, fs=0.5, nperseg=min(len(ts), 64))
+                    idx = (freqs >= 0.01) & (freqs <= 0.073)
+                    if np.any(idx):
+                        slow_power = np.mean(psd[idx])
+                        feat.append(slow_power if not np.isnan(slow_power) else 0.0)
+                    else:
+                        feat.append(0.0)
+                except:
+                    feat.append(0.0)
+            except:
+                feat = [0.0] * 6
+
+            # 检查nan
+            feat = [0.0 if np.isnan(f) or np.isinf(f) else f for f in feat]
             features.append(feat)
 
         features = np.array(features, dtype=np.float32)
+        features = np.nan_to_num(features, nan=0.0, posinf=0.0, neginf=0.0)
+
+        # 标准化
         from sklearn.preprocessing import StandardScaler
-        features = StandardScaler().fit_transform(features)
+        scaler = StandardScaler()
+
+        # 检查全0列
+        for col in range(features.shape[1]):
+            if np.std(features[:, col]) < 1e-6:
+                features[:, col] = np.random.randn(features.shape[0]) * 0.01
+
+        features = scaler.fit_transform(features)
+        features = np.nan_to_num(features, nan=0.0, posinf=0.0, neginf=0.0)
 
         return torch.tensor(features, dtype=torch.float)
 
     def _extract_mdd_structural_features(self, time_series):
-        """MDD结构特征"""
-        return self._extract_mdd_functional_features(time_series)[:, :4]
+        """MDD结构特征（添加 nan 处理）"""
+        features = []
+
+        for i in range(time_series.shape[1]):
+            ts = time_series[:, i]
+
+            # 检查并处理nan值
+            if np.isnan(ts).any():
+                ts = np.nan_to_num(ts, nan=0.0, posinf=0.0, neginf=0.0)
+
+            # 如果整个时间序列都是0或常数
+            if np.std(ts) < 1e-6:
+                ts = ts + np.random.randn(len(ts)) * 0.01
+
+            try:
+                feat = [
+                    np.mean(ts),
+                    np.std(ts) if np.std(ts) > 0 else 1e-6,
+                    np.median(ts),
+                    np.ptp(ts) if np.ptp(ts) > 0 else 1e-6
+                ]
+            except:
+                feat = [0.0, 1.0, 0.0, 1.0]
+
+            # 检查nan
+            feat = [0.0 if np.isnan(f) or np.isinf(f) else f for f in feat]
+            features.append(feat)
+
+        features = np.array(features, dtype=np.float32)
+        features = np.nan_to_num(features, nan=0.0, posinf=0.0, neginf=0.0)
+
+        # 标准化
+        from sklearn.preprocessing import StandardScaler
+        scaler = StandardScaler()
+
+        # 检查全0列
+        for col in range(features.shape[1]):
+            if np.std(features[:, col]) < 1e-6:
+                features[:, col] = np.random.randn(features.shape[0]) * 0.01
+
+        features = scaler.fit_transform(features)
+        features = np.nan_to_num(features, nan=0.0, posinf=0.0, neginf=0.0)
+
+        return torch.tensor(features, dtype=torch.float)
 
     def _matrix_to_pyg(self, matrix, features, label):
-        """转换为PyG格式"""
+        """转换为PyG格式（添加 nan 处理）"""
+        # 确保矩阵无 nan
+        matrix = np.nan_to_num(matrix, nan=0.0, posinf=0.0, neginf=0.0)
+
         edge_index = []
         edge_attr = []
 
         n = matrix.shape[0]
         for i in range(n):
             for j in range(i + 1, n):
-                if matrix[i, j] != 0:
+                weight = matrix[i, j]
+                # 检查权重
+                if np.isnan(weight) or np.isinf(weight):
+                    weight = 0.0
+
+                if weight != 0:
                     edge_index.extend([[i, j], [j, i]])
-                    edge_attr.extend([matrix[i, j], matrix[i, j]])
+                    edge_attr.extend([weight, weight])
+
+        # 如果没有边，添加自环
+        if len(edge_index) == 0:
+            for i in range(min(10, n)):
+                edge_index.extend([[i, i]])
+                edge_attr.extend([1.0])
 
         edge_index = torch.tensor(edge_index, dtype=torch.long).t()
         edge_attr = torch.tensor(edge_attr, dtype=torch.float)
+
+        # 再次检查
+        if torch.isnan(features).any():
+            features = torch.nan_to_num(features, nan=0.0, posinf=0.0, neginf=0.0)
+
+        if torch.isnan(edge_attr).any():
+            edge_attr = torch.nan_to_num(edge_attr, nan=0.0, posinf=0.0, neginf=0.0)
 
         return Data(
             x=features,
@@ -617,7 +845,7 @@ def process_dual_stream(self):
         print("未找到MDD数据，创建模拟数据...")
         data_dict = self.create_mock_data(n_subjects=60)
 
-    print("构建双流数据...")
+    print("\n构建双流数据...")
 
     for idx, time_series in enumerate(data_dict['time_series']):
         try:
@@ -633,13 +861,13 @@ def process_dual_stream(self):
             dual_stream_data.append((func_data, struct_data))
 
             if (idx + 1) % 10 == 0:
-                print(f"处理进度: {idx + 1}/{len(data_dict['time_series'])}")
+                print(f"  处理进度: {idx + 1}/{len(data_dict['time_series'])}")
 
         except Exception as e:
-            print(f"处理被试{idx}失败: {e}")
+            print(f"  处理被试{idx}失败: {e}")
             continue
 
-    print(f"成功构建{len(dual_stream_data)}个双流样本")
+    print(f"\n成功构建{len(dual_stream_data)}个双流样本")
 
     # 保存
     save_path = os.path.join(self.processed_path, 'mdd_dual_stream.pt')
@@ -651,6 +879,26 @@ def process_dual_stream(self):
 
 # 正确的类名：MDDDataProcessor
 MDDDataProcessor.process_dual_stream = process_dual_stream
+
+
+def load_mdd_data(data_folder='./data', graph_method='correlation_matrix'):
+    """
+    便捷函数：加载MDD数据集
+    """
+    processor = MDDDataProcessor(data_folder=data_folder)
+
+    # 尝试加载已处理的数据
+    graph_list = processor.load_processed_data(graph_method=graph_method)
+
+    if graph_list:
+        input_dim = graph_list[0].x.shape[1]
+        output_dim = 2  # 二分类任务
+    else:
+        input_dim = 0
+        output_dim = 2
+
+    return graph_list, input_dim, output_dim
+
 
 # 添加主函数
 if __name__ == "__main__":
