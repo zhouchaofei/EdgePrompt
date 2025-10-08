@@ -609,6 +609,107 @@ def prepare_all_data(data_folder='./data', n_subjects=None):
     return results
 
 
+# 在 abide_data.py 文件的最末尾添加以下代码
+
+def load_abide_data(data_folder='./data', n_subjects=None, graph_method='correlation_matrix'):
+    """
+    便捷函数：加载ABIDE数据集（单流版本，用于传统方法）
+
+    Args:
+        data_folder: 数据保存路径
+        n_subjects: 被试数量
+        graph_method: 图构建方法（虽然传入但不使用，为了兼容性）
+
+    Returns:
+        graph_list: 图数据列表
+        input_dim: 输入特征维度
+        output_dim: 输出类别数
+    """
+    print("=" * 60)
+    print("加载ABIDE数据集（单流版本）")
+    print("=" * 60)
+
+    # 检查是否存在双流数据
+    dual_stream_path = os.path.join(data_folder, 'ABIDE/processed/abide_dual_stream_temporal_78.pt')
+
+    if os.path.exists(dual_stream_path):
+        print(f"检测到双流数据文件: {dual_stream_path}")
+        print("从双流数据提取功能流作为单流数据...")
+
+        # 加载双流数据
+        dual_stream_data = torch.load(dual_stream_path)
+
+        # 提取功能流（第一个元素）
+        graph_list = [func_data for func_data, struct_data in dual_stream_data]
+
+        if graph_list:
+            input_dim = graph_list[0].x.shape[1]
+            output_dim = 2  # 二分类
+
+            print(f"成功加载 {len(graph_list)} 个样本")
+            print(f"输入维度: {input_dim}")
+            print(f"输出类别数: {output_dim}")
+        else:
+            print("警告：数据为空")
+            input_dim = 0
+            output_dim = 2
+
+    else:
+        print(f"未找到双流数据: {dual_stream_path}")
+        print("请先运行数据处理脚本生成数据")
+        print("\n运行命令：")
+        print("python abide_data.py")
+
+        # 返回空数据
+        graph_list = []
+        input_dim = 0
+        output_dim = 2
+
+    print("=" * 60)
+
+    return graph_list, input_dim, output_dim
+
+
 if __name__ == "__main__":
-    # 一键准备所有数据
-    prepare_all_data(data_folder='./data', n_subjects=None)
+    # 主函数保持不变
+    print("=" * 60)
+    print("ABIDE数据处理")
+    print("=" * 60)
+
+    # 询问用户选择
+    print("\n选择操作：")
+    print("1. 生成双流数据（推荐，用于SF-DPL）")
+    print("2. 测试加载功能")
+
+    choice = input("\n请选择 (1/2): ").strip()
+
+    if choice == '1':
+        # 生成双流数据
+        from abide_data import prepare_all_data
+
+        prepare_all_data(
+            data_folder='./data',
+            n_subjects=None,
+            force_reprocess=False
+        )
+
+    elif choice == '2':
+        # 测试加载
+        graph_list, input_dim, output_dim = load_abide_data(
+            data_folder='./data'
+        )
+
+        if graph_list:
+            print(f"\n加载成功！")
+            print(f"样本数: {len(graph_list)}")
+            print(f"第一个样本信息:")
+            print(f"  节点特征: {graph_list[0].x.shape}")
+            print(f"  边索引: {graph_list[0].edge_index.shape}")
+            print(f"  标签: {graph_list[0].y.item()}")
+
+    else:
+        print("无效选择")
+
+# if __name__ == "__main__":
+#     # 一键准备所有数据
+#     prepare_all_data(data_folder='./data', n_subjects=None)

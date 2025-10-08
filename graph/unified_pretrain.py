@@ -566,7 +566,6 @@ class DatasetRegistry:
 
         return max_length if is_temporal else None
 
-
     @classmethod
     def load_dataset(cls, dataset_name: str, data_format: str):
         """加载数据集"""
@@ -600,13 +599,22 @@ class DatasetRegistry:
         # 根据格式处理
         if data_format == 'dual_stream_temporal':
             # ==========================================
-            # 双流数据：只使用功能流！
+            # ⭐ 关键修改：双流数据只使用功能流！
             # ==========================================
+            print(f"\n{'=' * 60}")
+            print(f"双流数据预训练策略")
+            print(f"{'=' * 60}")
+            print(f"原始数据格式: [(func_graph, struct_graph), ...]")
+            print(f"提取: 只使用功能流进行预训练")
+            print(f"原因: 结构流是固定的解剖连接，不需要预训练")
+            print(f"功能流: 包含个体化的功能连接模式，需要学习")
+
+            # 只提取功能流
             data_list = [func for func, struct in loaded_data]
 
-            print(f"双流数据：提取功能流进行预训练")
-            print(f"  总样本数: {len(loaded_data)}")
-            print(f"  功能流样本数: {len(data_list)}")
+            print(f"总样本数: {len(loaded_data)}")
+            print(f"功能流样本数: {len(data_list)}")
+            print(f"{'=' * 60}\n")
         else:
             # 单流数据：直接使用
             data_list = loaded_data
@@ -782,7 +790,7 @@ class PretrainTrainer:
 
         torch.save({
             'feature_encoder': self.model.feature_encoder.state_dict(),
-            'gnn': self.model.gnn.state_dict(),
+            'gnn': self.model.gnn.state_dict(),  # ⭐ 这是功能流的GNN权重
             'config': self.config,
             'epoch': epoch,
             'loss': loss
@@ -791,6 +799,8 @@ class PretrainTrainer:
         config_path = save_path.replace('.pth', '_config.json')
         with open(config_path, 'w') as f:
             json.dump(self.config, f, indent=2)
+
+        print(f"模型保存至: {save_path}")
 
 
 # ==========================================

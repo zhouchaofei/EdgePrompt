@@ -668,14 +668,17 @@ class GraphTask():
         return best_test_accuracy, best_test_f1
 
 
-class SF_DPL_Task(GraphTask):
-    """SF-DPL下游任务"""
+class SF_DPL_Task:
+    """SF-DPL下游任务（完整优化版）"""
 
-    def __init__(self, dataset_name, shots, device, logger,
+    def __init__(self,
+                 dataset_name,
+                 shots,
+                 device,
+                 logger,
                  graph_method='correlation_matrix',
                  pretrain_task='GraphMAE',
                  pretrain_source='same',
-                 # 新增可调参数
                  num_layer=5,
                  hidden_dim=128,
                  drop_ratio=0.3,
@@ -702,22 +705,22 @@ class SF_DPL_Task(GraphTask):
         # 加载双流数据
         self.load_dual_stream_data()
 
-        # 获取输入维度（关键修改）
+        # ⭐ 关键修改：动态获取输入维度
         sample_data = self.dual_stream_data[0]
-        struct_input_dim = sample_data[1].x.shape[1]  # 结构流维度
-        func_input_dim = sample_data[0].x.shape[1]  # 功能流维度
+        struct_input_dim = sample_data[1].x.shape[1]  # 结构流
+        func_input_dim = sample_data[0].x.shape[1]  # 功能流
 
         self.logger.info(f"检测到输入特征维度:")
         self.logger.info(f"  结构流: {struct_input_dim}")
         self.logger.info(f"  功能流: {func_input_dim}")
 
-        # 初始化SF-DPL模型（使用两个不同的输入维度）
+        # 初始化SF-DPL模型
         from sf_dpl_model import SF_DPL
 
         self.model = SF_DPL(
             num_layer=num_layer,
-            struct_input_dim=struct_input_dim,  # 结构流
-            func_input_dim=func_input_dim,  # 功能流
+            struct_input_dim=struct_input_dim,
+            func_input_dim=func_input_dim,
             hidden_dim=hidden_dim,
             num_classes=2,
             drop_ratio=drop_ratio,
@@ -737,7 +740,7 @@ class SF_DPL_Task(GraphTask):
         self.logger.info(f"  可训练参数: {trainable_params:,}")
 
     def load_pretrained_weights(self):
-        """加载预训练权重到双流编码器（处理维度不匹配）"""
+        """加载预训练权重到双流编码器"""
         if self.pretrain_task is None or self.pretrain_task == 'None':
             self.logger.info("不使用预训练模型")
             return
@@ -747,21 +750,19 @@ class SF_DPL_Task(GraphTask):
             source = self.dataset_name
             target = self.dataset_name
         elif self.pretrain_source == 'cross':
-            # 跨数据集：ABIDE<->MDD
             source = 'MDD' if self.dataset_name == 'ABIDE' else 'ABIDE'
             target = self.dataset_name
         else:
-            # 直接指定源
             source = self.pretrain_source
             target = self.dataset_name
 
-        # 构建路径
+        # ⭐ 关键：使用双流预训练模型
         if self.pretrain_task == 'GraphMAE':
-            pretrain_dir = './pretrained_models/graphmae'
-            pretrain_file = f'graphmae_{source}_for_{target}_{self.graph_method}.pth'
+            pretrain_dir = './pretrained_models/dual_stream_temporal'
+            pretrain_file = f'graphmae_{source}_for_{target}.pth'
         elif self.pretrain_task == 'EdgePrediction':
-            pretrain_dir = './pretrained_models/edge_prediction'
-            pretrain_file = f'edge_prediction_{source}_for_{target}_{self.graph_method}.pth'
+            pretrain_dir = './pretrained_models/dual_stream_temporal'
+            pretrain_file = f'edge_prediction_{source}_for_{target}.pth'
         else:
             self.logger.warning(f"未知的预训练任务: {self.pretrain_task}")
             return
@@ -770,81 +771,67 @@ class SF_DPL_Task(GraphTask):
 
         if not os.path.exists(pretrain_path):
             self.logger.warning(f"预训练模型不存在: {pretrain_path}")
-            self.logger.warning("将从随机初始化开始训练")
             return
 
-        # 加载权重
         self.logger.info(f"加载预训练模型: {pretrain_path}")
-        checkpoint = torch.load(pretrain_path, map_location=self.device)
 
-        # 根据不同预训练任务提取encoder权重
-        if 'model_state_dict' in checkpoint:
-            state_dict = checkpoint['model_state_dict']
-        elif 'state_dict' in checkpoint:
-            state_dict = checkpoint['state_dict']
-        else:
-            state_dict = checkpoint
-
-        # 提取encoder部分（排除第一层，因为输入维度可能不匹配）
-        encoder_state = {}
-        for k, v in state_dict.items():
-            # 跳过第一层卷积（输入层）
-            if 'convs.0' in k and ('mlp.0.weight' in k or 'mlp.0.bias' in k):
-                self.logger.info(f"跳过第一层权重（维度不匹配）: {k}")
-                continue
-
-            # 只保留encoder相关的权重
-            if 'encoder' in k:
-                new_k = k.replace('encoder.', '')
-                encoder_state[new_k] = v
-            elif not any(x in k for x in ['decoder', 'classifier', 'prediction', 'edge_pred']):
-                encoder_state[k] = v
-
-        # 加载到双流编码器（使用strict=False允许部分加载）
         try:
-            # 结构流编码器
-            missing_keys, unexpected_keys = self.model.struct_encoder.load_state_dict(
-                encoder_state, strict=False
-            )
-            self.logger.info("结构编码器加载预训练权重:")
-            self.logger.info(f"  成功加载: {len(encoder_state) - len(missing_keys)} 个参数")
-            if missing_keys:
-                self.logger.info(f"  未匹配的键: {len(missing_keys)} 个（包括第一层）")
+            checkpoint = torch.load(pretrain_path, map_location=self.device)
 
-            # 功能流编码器
-            missing_keys, unexpected_keys = self.model.func_encoder.load_state_dict(
-                encoder_state, strict=False
-            )
-            self.logger.info("功能编码器加载预训练权重:")
-            self.logger.info(f"  成功加载: {len(encoder_state) - len(missing_keys)} 个参数")
-            if missing_keys:
-                self.logger.info(f"  未匹配的键: {len(missing_keys)} 个（包括第一层）")
+            # 提取GNN权重
+            if 'gnn' in checkpoint:
+                gnn_state_dict = checkpoint['gnn']
+            elif 'model_state_dict' in checkpoint:
+                gnn_state_dict = checkpoint['model_state_dict']
+            else:
+                gnn_state_dict = checkpoint
 
-            self.logger.info("预训练权重加载完成（第一层保持随机初始化）")
+            # ⭐ 关键：跳过第一层（输入层）的权重
+            filtered_state = {}
+            for k, v in gnn_state_dict.items():
+                # 跳过第一层的权重
+                if 'convs.0.mlp.0' in k:
+                    self.logger.info(f"跳过第一层权重: {k} (维度不匹配)")
+                    continue
+                filtered_state[k] = v
+
+            # 加载到结构编码器（strict=False允许部分加载）
+            if self.model.struct_encoder:
+                self.model.struct_encoder.load_state_dict(filtered_state, strict=False)
+                self.logger.info("结构编码器加载预训练权重完成")
+
+            # 加载到功能编码器
+            if self.model.func_encoder:
+                self.model.func_encoder.load_state_dict(filtered_state, strict=False)
+                self.logger.info("功能编码器加载预训练权重完成")
 
         except Exception as e:
-            self.logger.warning(f"加载预训练权重时出现警告: {e}")
+            self.logger.warning(f"加载预训练权重失败: {e}")
             self.logger.warning("将继续训练...")
 
     def load_dual_stream_data(self):
         """加载双流数据"""
         if self.dataset_name == 'ABIDE':
-            data_path = './data/ABIDE/processed/abide_dual_stream.pt'
+            data_path = './data/ABIDE/processed/abide_dual_stream_temporal_78.pt'
+
             if not os.path.exists(data_path):
-                from abide_data import ABIDEDataProcessor
-                processor = ABIDEDataProcessor()
-                self.dual_stream_data = processor.process_dual_stream()
-            else:
-                self.dual_stream_data = torch.load(data_path)
+                self.logger.error(f"数据文件不存在: {data_path}")
+                self.logger.info("请先运行数据处理脚本生成双流数据")
+                raise FileNotFoundError(f"数据文件不存在: {data_path}")
+
+            self.dual_stream_data = torch.load(data_path)
 
         elif self.dataset_name == 'MDD':
-            data_path = './data/REST-meta-MDD/processed/mdd_dual_stream.pt'
+            data_path = './data/REST-meta-MDD/processed/mdd_dual_stream_temporal_150.pt'
+
             if not os.path.exists(data_path):
-                from mdd_data import MDDDataProcessor
-                processor = MDDDataProcessor()
-                self.dual_stream_data = processor.process_dual_stream()
-            else:
-                self.dual_stream_data = torch.load(data_path)
+                self.logger.error(f"数据文件不存在: {data_path}")
+                raise FileNotFoundError(f"数据文件不存在: {data_path}")
+
+            self.dual_stream_data = torch.load(data_path)
+
+        else:
+            raise ValueError(f"不支持的数据集: {self.dataset_name}")
 
         # Few-shot划分
         labels = [d[0].y.item() for d in self.dual_stream_data]
@@ -868,8 +855,9 @@ class SF_DPL_Task(GraphTask):
         self.logger.info(f"测试样本: {len(self.test_data)}")
 
     def train_epoch(self):
-        """训练一个epoch（添加梯度裁剪和nan检查）"""
+        """训练一个epoch（改进版）"""
         from torch_geometric.data import Batch
+        from sf_dpl_model import train_sf_dpl_one_epoch
 
         self.model.train()
         total_loss = 0
@@ -877,14 +865,12 @@ class SF_DPL_Task(GraphTask):
         total_ortho_loss = 0
         num_batches = 0
 
-        # 批处理
         batch_size = 32
         random.shuffle(self.train_data)
 
         for i in range(0, len(self.train_data), batch_size):
             batch_data = self.train_data[i:i + batch_size]
 
-            # 分离双流
             func_list = [d[0] for d in batch_data]
             struct_list = [d[1] for d in batch_data]
 
@@ -896,7 +882,6 @@ class SF_DPL_Task(GraphTask):
                 self.logger.warning("检测到输入数据中有nan，跳过该batch")
                 continue
 
-            # 前向传播
             self.optimizer.zero_grad()
             output, ortho_loss = self.model(struct_batch, func_batch)
 
@@ -905,7 +890,6 @@ class SF_DPL_Task(GraphTask):
                 self.logger.warning("检测到输出中有nan，跳过该batch")
                 continue
 
-            # 损失
             ce_loss = F.cross_entropy(output, func_batch.y)
             loss = ce_loss + ortho_loss
 
@@ -916,7 +900,7 @@ class SF_DPL_Task(GraphTask):
 
             loss.backward()
 
-            # 梯度裁剪（防止梯度爆炸）
+            # ⭐ 梯度裁剪（防止梯度爆炸）
             torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
 
             self.optimizer.step()
@@ -936,7 +920,8 @@ class SF_DPL_Task(GraphTask):
     def evaluate(self):
         """评估（返回多个指标）"""
         from torch_geometric.data import Batch
-        from sklearn.metrics import accuracy_score, f1_score, roc_auc_score, precision_score, recall_score
+        from sklearn.metrics import (accuracy_score, f1_score, roc_auc_score,
+                                     precision_score, recall_score)
 
         self.model.eval()
         all_preds = []
@@ -996,11 +981,16 @@ class SF_DPL_Task(GraphTask):
 
         return metrics
 
-    def run(self, epochs=100):
-        """运行训练和评估（改进的日志输出）"""
+    def run(self, epochs=None):
+        """运行训练和评估"""
+        if epochs is None:
+            epochs = self.epochs
+
         best_acc = 0
         best_f1 = 0
         best_epoch = 0
+        patience = 0
+        max_patience = 20
 
         self.logger.info("\n" + "=" * 80)
         self.logger.info("开始训练SF-DPL模型")
@@ -1011,16 +1001,19 @@ class SF_DPL_Task(GraphTask):
             train_loss, train_ce_loss, train_ortho_loss = self.train_epoch()
 
             # 评估
-            if epoch % 1 == 0:  # 每5个epoch评估一次
+            if epoch % 1 == 0:
                 test_metrics = self.evaluate()
 
                 # 更新最佳结果
                 if test_metrics['accuracy'] > best_acc:
                     best_acc = test_metrics['accuracy']
                     best_epoch = epoch
+                    patience = 0
 
                 if test_metrics['f1'] > best_f1:
                     best_f1 = test_metrics['f1']
+                else:
+                    patience += 1
 
                 # 格式化日志输出
                 log_info = ''.join([
@@ -1032,12 +1025,15 @@ class SF_DPL_Task(GraphTask):
                     '| test_acc: {:7.5f} '.format(test_metrics['accuracy']),
                     '| test_f1: {:7.5f} '.format(test_metrics['f1']),
                     '| test_auc: {:7.5f} '.format(test_metrics['auc']),
-                    '| test_prec: {:7.5f} '.format(test_metrics['precision']),
-                    '| test_recall: {:7.5f} '.format(test_metrics['recall']),
                     '| best_acc: {:7.5f} |'.format(best_acc)
                 ])
 
                 self.logger.info(log_info)
+
+                # 早停
+                if patience >= max_patience:
+                    self.logger.info(f"早停：{max_patience}轮未改善")
+                    break
 
         self.logger.info("\n" + "=" * 80)
         self.logger.info(f"训练完成！最佳准确率: {best_acc:.4f} (Epoch {best_epoch})")
@@ -1191,7 +1187,7 @@ if __name__ == '__main__':
             formatter = logging.Formatter('%(asctime)s - %(message)s')
             logger = Logger(log_file, formatter)
 
-            # 创建任务
+            # ⭐ 创建SF_DPL任务
             task = SF_DPL_Task(
                 args.dataset_name,
                 args.shots,
