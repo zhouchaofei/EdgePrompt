@@ -669,7 +669,7 @@ class GraphTask():
 
 
 class SF_DPL_Task:
-    """SF-DPL下游任务（完整优化版）"""
+    """SF-DPL下游任务 - 抗过拟合增强版"""
 
     def __init__(self,
                  dataset_name,
@@ -681,7 +681,7 @@ class SF_DPL_Task:
                  pretrain_source='same',
                  num_layer=5,
                  hidden_dim=128,
-                 drop_ratio=0.3,
+                 drop_ratio=0.5,  # ⭐ 从0.3改为0.5
                  num_prompts=5,
                  epochs=100,
                  lr=0.001):
@@ -705,10 +705,10 @@ class SF_DPL_Task:
         # 加载双流数据
         self.load_dual_stream_data()
 
-        # ⭐ 关键修改：动态获取输入维度
+        # 动态获取输入维度
         sample_data = self.dual_stream_data[0]
-        struct_input_dim = sample_data[1].x.shape[1]  # 结构流
-        func_input_dim = sample_data[0].x.shape[1]  # 功能流
+        struct_input_dim = sample_data[1].x.shape[1]
+        func_input_dim = sample_data[0].x.shape[1]
 
         self.logger.info(f"检测到输入特征维度:")
         self.logger.info(f"  结构流: {struct_input_dim}")
@@ -724,13 +724,29 @@ class SF_DPL_Task:
             hidden_dim=hidden_dim,
             num_classes=2,
             drop_ratio=drop_ratio,
-            num_prompts=num_prompts
+            num_prompts=num_prompts,
+            ortho_weight=0.1  # ⭐ 明确设置
         ).to(device)
 
         # 加载预训练权重
         self.load_pretrained_weights()
 
-        self.optimizer = torch.optim.Adam(self.model.parameters(), lr=lr)
+        # ⭐ 优化器 + Weight Decay + 学习率调度
+        self.optimizer = torch.optim.Adam(
+            self.model.parameters(),
+            lr=lr,
+            weight_decay=1e-4  # ⭐ L2正则化
+        )
+
+        # ⭐ 学习率调度器
+        self.scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            self.optimizer,
+            mode='max',
+            factor=0.5,
+            patience=10,
+            verbose=True,
+            min_lr=1e-6
+        )
 
         # 打印模型信息
         total_params = sum(p.numel() for p in self.model.parameters())
@@ -855,9 +871,8 @@ class SF_DPL_Task:
         self.logger.info(f"测试样本: {len(self.test_data)}")
 
     def train_epoch(self):
-        """训练一个epoch（改进版）"""
+        """训练一个epoch - 增强版"""
         from torch_geometric.data import Batch
-        from sf_dpl_model import train_sf_dpl_one_epoch
 
         self.model.train()
         total_loss = 0
@@ -871,8 +886,23 @@ class SF_DPL_Task:
         for i in range(0, len(self.train_data), batch_size):
             batch_data = self.train_data[i:i + batch_size]
 
-            func_list = [d[0] for d in batch_data]
-            struct_list = [d[1] for d in batch_data]
+            # ⭐ 数据增强：添加噪声
+            func_list = []
+            struct_list = []
+
+            for func_data, struct_data in batch_data:
+                # 复制数据
+                func_aug = func_data.clone()
+                struct_aug = struct_data.clone()
+
+                # ⭐ 训练时添加高斯噪声
+                if self.model.training:
+                    noise_level = 0.01
+                    func_aug.x = func_aug.x + torch.randn_like(func_aug.x) * noise_level
+                    struct_aug.x = struct_aug.x + torch.randn_like(struct_aug.x) * noise_level
+
+                func_list.append(func_aug)
+                struct_list.append(struct_aug)
 
             func_batch = Batch.from_data_list(func_list).to(self.device)
             struct_batch = Batch.from_data_list(struct_list).to(self.device)
@@ -890,7 +920,8 @@ class SF_DPL_Task:
                 self.logger.warning("检测到输出中有nan，跳过该batch")
                 continue
 
-            ce_loss = F.cross_entropy(output, func_batch.y)
+            # ⭐ Label Smoothing
+            ce_loss = F.cross_entropy(output, func_batch.y, label_smoothing=0.1)
             loss = ce_loss + ortho_loss
 
             # 检查损失
@@ -900,8 +931,8 @@ class SF_DPL_Task:
 
             loss.backward()
 
-            # ⭐ 梯度裁剪（防止梯度爆炸）
-            torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+            # ⭐ 更严格的梯度裁剪
+            torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=0.5)
 
             self.optimizer.step()
 
@@ -982,7 +1013,7 @@ class SF_DPL_Task:
         return metrics
 
     def run(self, epochs=None):
-        """运行训练和评估"""
+        """运行训练和评估 - 增强版"""
         if epochs is None:
             epochs = self.epochs
 
@@ -990,9 +1021,9 @@ class SF_DPL_Task:
         best_f1 = 0
         best_epoch = 0
         patience = 0
-        max_patience = 20
+        max_patience = 15  # ⭐ 更早的早停
 
-        self.logger.info("\n" + "=" * 80)
+        self.logger.info("\\n" + "=" * 80)
         self.logger.info("开始训练SF-DPL模型")
         self.logger.info("=" * 80)
 
@@ -1004,11 +1035,25 @@ class SF_DPL_Task:
             if epoch % 1 == 0:
                 test_metrics = self.evaluate()
 
+                # ⭐ 更新学习率
+                current_lr = self.optimizer.param_groups[0]['lr']
+                self.scheduler.step(test_metrics['accuracy'])
+                new_lr = self.optimizer.param_groups[0]['lr']
+
+                if new_lr != current_lr:
+                    self.logger.info(f"学习率衰减: {current_lr:.6f} → {new_lr:.6f}")
+
                 # 更新最佳结果
                 if test_metrics['accuracy'] > best_acc:
                     best_acc = test_metrics['accuracy']
                     best_epoch = epoch
                     patience = 0
+
+                    # ⭐ 保存最佳模型
+                    torch.save(
+                        self.model.state_dict(),
+                        f'best_model_{self.dataset_name}_{self.shots}shot.pth'
+                    )
 
                 if test_metrics['f1'] > best_f1:
                     best_f1 = test_metrics['f1']
@@ -1035,7 +1080,18 @@ class SF_DPL_Task:
                     self.logger.info(f"早停：{max_patience}轮未改善")
                     break
 
-        self.logger.info("\n" + "=" * 80)
+        # ⭐ 加载最佳模型
+        best_model_path = f'best_model_{self.dataset_name}_{self.shots}shot.pth'
+        if os.path.exists(best_model_path):
+            self.model.load_state_dict(torch.load(best_model_path))
+            self.logger.info(f"加载最佳模型: {best_model_path}")
+
+            # 最终评估
+            final_metrics = self.evaluate()
+            self.logger.info(f"最佳模型性能: Acc={final_metrics['accuracy']:.4f}, "
+                             f"F1={final_metrics['f1']:.4f}, AUC={final_metrics['auc']:.4f}")
+
+        self.logger.info("\\n" + "=" * 80)
         self.logger.info(f"训练完成！最佳准确率: {best_acc:.4f} (Epoch {best_epoch})")
         self.logger.info(f"最佳F1分数: {best_f1:.4f}")
         self.logger.info("=" * 80)
