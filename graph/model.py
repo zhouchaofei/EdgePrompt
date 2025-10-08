@@ -34,6 +34,7 @@ class GIN(nn.Module):
         super(GIN, self).__init__()
         self.num_layer = num_layer
         self.drop_ratio = drop_ratio
+        self.hidden_dim = hidden_dim  # 添加：保存hidden_dim
 
         if self.num_layer < 2:
             raise ValueError("Number of GNN layers must be greater than 1.")
@@ -196,7 +197,6 @@ class GIN(nn.Module):
                     x = F.dropout(F.relu(x), self.drop_ratio, training=self.training)
                 h_list.append(x)
 
-
         # 新增：图小波变换
         elif prompt_type == 'GraphWaveletPrompt':
             for layer in range(self.num_layer):
@@ -295,7 +295,6 @@ class GIN(nn.Module):
                     x = F.dropout(F.relu(x), self.drop_ratio, training=self.training)
                 h_list.append(x)
 
-
         # 原有的边提示方法
         elif prompt_type in ['EdgePrompt', 'EdgePromptplus']:
             for layer in range(self.num_layer):
@@ -324,8 +323,47 @@ class GIN(nn.Module):
                 h_list.append(x)
 
         node_emb = h_list[-1]
+
         if pooling == 'mean':
             graph_emb = global_mean_pool(node_emb, batch)
             return graph_emb
 
         return node_emb
+
+    # ==========================================
+    # 新增方法：获取节点嵌入（用于EdgePrediction预训练）
+    # ==========================================
+    def get_node_embeddings(self, data):
+        """
+        获取节点级嵌入（用于边预测等任务）
+
+        Args:
+            data: PyG Data对象
+                - data.x: [N, input_dim] 节点特征
+                - data.edge_index: [2, E] 边索引
+                - data.batch: [N] batch索引（可选）
+
+        Returns:
+            node_embeddings: [N, hidden_dim] 节点嵌入
+
+        使用场景：
+            - EdgePrediction预训练任务
+            - 需要节点级别表示的下游任务
+            - Link prediction等边相关任务
+        """
+        x, edge_index = data.x, data.edge_index
+
+        # 通过所有GNN层（不使用prompt）
+        h = x
+        for layer in range(self.num_layer):
+            h = self.convs[layer](h, edge_index, edge_prompt=False)
+            h = self.batch_norms[layer](h)
+
+            if layer == self.num_layer - 1:
+                # 最后一层
+                h = F.dropout(h, self.drop_ratio, training=self.training)
+            else:
+                # 中间层
+                h = F.dropout(F.relu(h), self.drop_ratio, training=self.training)
+
+        return h  # [N, hidden_dim]

@@ -1,6 +1,9 @@
 """
-ABIDE数据集处理模块
-支持下载、处理和构建脑功能图
+ABIDE数据集处理模块 - 整合版
+支持：
+1. 传统单流图（基线实验）
+2. 双流图（SF-DPL实验）
+3. 时序特征 + 统计特征
 """
 import os
 import numpy as np
@@ -8,262 +11,225 @@ import pandas as pd
 import torch
 from torch_geometric.data import Data
 from nilearn.datasets import fetch_abide_pcp
-from nilearn.connectome import ConnectivityMeasure
 from sklearn.preprocessing import StandardScaler
-from scipy import signal, stats
-from sklearn.covariance import LedoitWolf
+from scipy import stats, signal
+import networkx as nx
 import warnings
-
 warnings.filterwarnings('ignore')
 
 
 class ABIDEDataProcessor:
-    """ABIDE数据集处理器"""
+    """
+    统一的ABIDE数据处理器
 
-    def __init__(self, data_folder='./data',
+    核心功能：
+    1. 下载和预处理数据
+    2. 生成多种格式的图数据
+    3. 支持不同的节点特征类型
+    """
+
+    def __init__(self,
+                 data_folder='./data',
                  pipeline='cpac',
-                 atlas='ho',
-                 connectivity_kind='correlation',
-                 threshold=0.3):
+                 atlas='aal',  # 使用AAL图谱
+                 time_strategy='adaptive',
+                 min_time_length=78):
         """
-        初始化ABIDE数据处理器
-
         Args:
-            data_folder: 数据保存路径
-            pipeline: 预处理管道 ('cpac', 'ccs', 'dparsf', 'niak')
-            atlas: 脑区分割图谱 ('ho', 'cc200', 'cc400', 'aal', 'ez', 'dosenbach160')
-            connectivity_kind: 连接性度量方式 ('correlation', 'partial correlation', 'covariance')
-            threshold: 边权重阈值，用于构建稀疏图
+            time_strategy:
+                - 'adaptive': 自适应确定时间长度
+                - 'fixed': 固定到min_time_length
         """
+
         self.data_folder = data_folder
         self.pipeline = pipeline
         self.atlas = atlas
-        self.connectivity_kind = connectivity_kind
-        self.threshold = threshold
+        self.time_strategy = time_strategy
+        self.min_time_length = min_time_length
+
         self.abide_path = os.path.join(data_folder, 'ABIDE')
         self.processed_path = os.path.join(self.abide_path, 'processed')
 
-        # 创建必要的目录
         os.makedirs(self.processed_path, exist_ok=True)
 
+        # 验证图谱类型
+        if self.atlas not in ['aal']:
+            print(f"警告：为了与MDD统一，建议使用AAL图谱")
+            print(f"当前使用: {self.atlas}")
+
     def download_data(self, n_subjects=None):
-        """
-        下载ABIDE数据集
-
-        Args:
-            n_subjects: 下载的被试数量，None表示全部
-
-        Returns:
-            data: 下载的数据字典
-        """
-        print(f"正在下载ABIDE数据集...")
+        """下载ABIDE数据 - AAL图谱"""
+        print(f"下载ABIDE数据集...")
         print(f"参数: pipeline={self.pipeline}, atlas={self.atlas}")
 
-        # 根据atlas选择不同的数据类型
-        if self.atlas == 'ho':
+        # 确定derivatives
+        if self.atlas == 'aal':
+            derivatives = 'rois_aal'
+            print("使用AAL-116图谱（与MDD数据集统一）")
+        elif self.atlas == 'ho':
             derivatives = 'rois_ho'
+            print("警告：HO图谱只有111个ROI，与MDD的AAL-116不统一")
         elif self.atlas in ['cc200', 'cc400']:
             derivatives = f'rois_{self.atlas}'
-        elif self.atlas == 'aal':
-            derivatives = 'rois_aal'
-        elif self.atlas == 'ez':
-            derivatives = 'rois_ez'
-        elif self.atlas == 'dosenbach160':
-            derivatives = 'rois_dosenbach160'
         else:
-            derivatives = 'rois_ho'  # 默认使用HO
+            derivatives = 'rois_aal'
+            print("默认使用AAL-116图谱")
 
         data = fetch_abide_pcp(
             data_dir=self.abide_path,
             pipeline=self.pipeline,
             band_pass_filtering=True,
-            global_signal_regression=True,
+            global_signal_regression=False,
             derivatives=derivatives,
             n_subjects=n_subjects,
             verbose=1
         )
 
-        # 调试信息
-        print(f"下载完成，数据结构:")
-        print(f"  - 可用属性: {dir(data)}")
-
-        # 检查不同的可能属性名
-        rois_attr = None
-        for attr in ['rois_ho', 'rois_cc200', 'rois_cc400', 'rois_aal', 'rois_ez', 'rois_dosenbach160']:
-            if hasattr(data, attr):
-                rois_attr = attr
-                rois_data = getattr(data, attr)
-                print(f"  - 找到ROI数据: {attr}")
-                print(f"  - ROI数据类型: {type(rois_data)}")
-                if rois_data is not None:
-                    print(f"  - ROI数据长度: {len(rois_data) if hasattr(rois_data, '__len__') else 'N/A'}")
-                    if len(rois_data) > 0:
-                        print(f"  - 第一个元素类型: {type(rois_data[0])}")
-                        if isinstance(rois_data[0], np.ndarray):
-                            print(f"  - 第一个元素形状: {rois_data[0].shape}")
-                break
-
-        if rois_attr is None:
-            print("  - 警告：未找到ROI数据属性")
+        print(f"下载完成，共 {len(data.phenotypic)} 个被试")
 
         return data
 
-    def construct_brain_graph(self, time_series, method='correlation_matrix'):
+    def determine_time_length(self, rois_data):
+        """确定统一的时间长度"""
+        lengths = []
+
+        for idx, roi_file in enumerate(rois_data[:50]):
+            try:
+                if isinstance(roi_file, str) and os.path.exists(roi_file):
+                    ts = pd.read_csv(roi_file, sep='\t', header=0).values
+                    lengths.append(ts.shape[0])
+            except:
+                continue
+
+        if not lengths:
+            return self.min_time_length
+
+        lengths = np.array(lengths)
+
+        if self.time_strategy == 'fixed':
+            return self.min_time_length
+        elif self.time_strategy == 'adaptive':
+            # 使用10th percentile
+            return int(np.percentile(lengths, 10))
+        else:
+            return self.min_time_length
+
+    def process_time_series(self, time_series, target_length):
+        """处理时间序列到目标长度"""
+        T, N = time_series.shape
+
+        if T >= target_length:
+            return time_series[:target_length, :]
+        else:
+            # 插值上采样
+            from scipy.interpolate import interp1d
+            t_old = np.linspace(0, 1, T)
+            t_new = np.linspace(0, 1, target_length)
+
+            resampled = np.zeros((target_length, N))
+            for i in range(N):
+                try:
+                    f = interp1d(t_old, time_series[:, i], kind='cubic')
+                    resampled[:, i] = f(t_new)
+                except:
+                    resampled[:, i] = np.interp(t_new, t_old, time_series[:, i])
+
+            return resampled
+
+    # ==========================================
+    # 节点特征提取：多种方式
+    # ==========================================
+
+    def extract_temporal_features(self, time_series):
         """
-        从时间序列构建脑功能连接图
+        提取时序特征（用于SF-DPL）
 
         Args:
-            time_series: 脑区时间序列 (time_points, n_regions)
-            method: 构建方法
-                - 'correlation_matrix': 相关矩阵（改进版）
-                - 'dynamic_connectivity': 动态连接性
-                - 'phase_synchronization': 相位同步
+            time_series: [T, N]
 
         Returns:
-            edge_index: 边索引
-            edge_attr: 边权重
-            node_features: 节点特征
+            features: [N, T] 每个节点是T维时间序列
         """
-        n_regions = time_series.shape[1]
-
-        if method == 'correlation_matrix':
-            # 计算皮尔逊相关系数矩阵
-            corr_matrix = np.corrcoef(time_series.T)
-
-            # 处理NaN值
-            corr_matrix = np.nan_to_num(corr_matrix, nan=0.0)
-
-            # Fisher z变换，稳定化相关系数
-            with np.errstate(divide='ignore', invalid='ignore'):
-                corr_matrix = np.arctanh(corr_matrix)
-                corr_matrix[np.isinf(corr_matrix)] = 0
-                corr_matrix[np.isnan(corr_matrix)] = 0
-
-            # 设置对角线为0
-            np.fill_diagonal(corr_matrix, 0)
-
-            # 应用阈值创建稀疏图
-            adj_matrix = np.abs(corr_matrix)
-
-            # 使用自适应阈值：保留最强的连接
-            if self.threshold < 1.0:
-                threshold_value = np.percentile(adj_matrix[adj_matrix > 0],
-                                                (1 - self.threshold) * 100)
-                adj_matrix[adj_matrix < threshold_value] = 0
-
-        elif method == 'dynamic_connectivity':
-            # 滑动窗口动态连接性
-            window_size = min(30, time_series.shape[0] // 3)
-            stride = window_size // 2
-            n_windows = (time_series.shape[0] - window_size) // stride + 1
-
-            dynamic_corr = []
-            for i in range(n_windows):
-                start = i * stride
-                end = start + window_size
-                window_data = time_series[start:end]
-                corr = np.corrcoef(window_data.T)
-                corr = np.nan_to_num(corr, nan=0.0)
-                dynamic_corr.append(corr)
-
-            # 平均动态连接性
-            adj_matrix = np.mean(dynamic_corr, axis=0)
-            np.fill_diagonal(adj_matrix, 0)
-            adj_matrix = np.abs(adj_matrix)
-
-            # 应用阈值
-            threshold_value = np.percentile(adj_matrix[adj_matrix > 0],
-                                            (1 - self.threshold) * 100)
-            adj_matrix[adj_matrix < threshold_value] = 0
-
-        elif method == 'phase_synchronization':
-            # 相位同步（使用希尔伯特变换）
-            from scipy.signal import hilbert
-
-            # 计算瞬时相位
-            analytic_signal = hilbert(time_series, axis=0)
-            phase = np.angle(analytic_signal)
-
-            # 计算相位同步
-            adj_matrix = np.zeros((n_regions, n_regions))
-            for i in range(n_regions):
-                for j in range(i + 1, n_regions):
-                    # 相位差
-                    phase_diff = phase[:, i] - phase[:, j]
-                    # 相位锁定值 (PLV)
-                    plv = np.abs(np.mean(np.exp(1j * phase_diff)))
-                    adj_matrix[i, j] = plv
-                    adj_matrix[j, i] = plv
-
-            # 应用阈值
-            threshold_value = np.percentile(adj_matrix[adj_matrix > 0],
-                                            (1 - self.threshold) * 100)
-            adj_matrix[adj_matrix < threshold_value] = 0
-
-        # 转换为PyG格式的边
-        edge_index = []
-        edge_attr = []
-        for i in range(n_regions):
-            for j in range(n_regions):
-                if adj_matrix[i, j] > 0 and i != j:
-                    edge_index.append([i, j])
-                    edge_attr.append(adj_matrix[i, j])
-
-        edge_index = torch.tensor(edge_index, dtype=torch.long).t()
-        edge_attr = torch.tensor(edge_attr, dtype=torch.float)
-
-        # 构建节点特征
-        node_features = self.extract_node_features(time_series)
-
-        return edge_index, edge_attr, node_features
-
-    def extract_node_features(self, time_series):
         """
-        从时间序列中提取节点特征
+            提取时序特征（添加标准化）
+
+            Args:
+                time_series: [T, N]
+
+            Returns:
+                features: [N, T] 标准化后的时序特征
+            """
+        # 转置
+        node_features = time_series.T  # [N, T] = [116, 78]
+
+        # ==========================================
+        # 关键修改：标准化每个节点的时间序列
+        # ==========================================
+        from sklearn.preprocessing import StandardScaler
+
+        # 转为numpy进行标准化
+        node_features_np = node_features  # 如果是torch tensor，转numpy
+        if isinstance(node_features_np, torch.Tensor):
+            node_features_np = node_features_np.numpy()
+
+        # 对每个节点（脑区）的时间序列单独标准化
+        scaler = StandardScaler()
+        for i in range(node_features_np.shape[0]):
+            # 将[T]变成[T, 1]以便标准化
+            ts = node_features_np[i].reshape(-1, 1)
+            node_features_np[i] = scaler.fit_transform(ts).flatten()
+
+        # 转回torch tensor
+        node_features = torch.tensor(node_features_np, dtype=torch.float)
+
+        # 验证标准化效果
+        if torch.isnan(node_features).any() or torch.isinf(node_features).any():
+            print("警告：标准化后出现NaN或Inf，使用原始数据")
+            return torch.tensor(time_series.T, dtype=torch.float)
+
+        return node_features
+
+    def extract_statistical_features(self, time_series):
+        """
+        提取统计特征（用于基线）
 
         Args:
-            time_series: 脑区时间序列 (time_points, n_regions)
+            time_series: [T, N]
 
         Returns:
-            node_features: 节点特征矩阵
+            features: [N, D] 每个节点是D维统计特征
         """
         features = []
 
         for i in range(time_series.shape[1]):
-            region_series = time_series[:, i]
+            ts = time_series[:, i]
 
-            # 统计特征
+            # 时域统计
             feat = [
-                np.mean(region_series),  # 均值
-                np.std(region_series),  # 标准差
-                np.median(region_series),  # 中位数
-                stats.skew(region_series),  # 偏度
-                stats.kurtosis(region_series),  # 峰度
-                np.percentile(region_series, 25),  # 25分位数
-                np.percentile(region_series, 75),  # 75分位数
-                np.max(region_series) - np.min(region_series),  # 范围
+                np.mean(ts),
+                np.std(ts),
+                np.median(ts),
+                np.ptp(ts),
+                stats.skew(ts) if not np.isnan(stats.skew(ts)) else 0,
+                stats.kurtosis(ts) if not np.isnan(stats.kurtosis(ts)) else 0,
+                np.percentile(ts, 25),
+                np.percentile(ts, 75)
             ]
 
-            # 频域特征（功率谱密度）
-            from scipy import signal
-            freqs, psd = signal.welch(region_series, fs=1.0, nperseg=min(len(region_series), 256))
-
-            # 提取不同频段的功率
-            # Delta (0.01-4 Hz), Theta (4-8 Hz), Alpha (8-13 Hz), Beta (13-30 Hz)
-            freq_bands = [(0.01, 0.04), (0.04, 0.08), (0.08, 0.13), (0.13, 0.30)]
-            for low, high in freq_bands:
-                idx = np.logical_and(freqs >= low, freqs <= high)
-                if np.any(idx):
-                    feat.append(np.mean(psd[idx]))
-                else:
-                    feat.append(0.0)
+            # 频域特征
+            try:
+                freqs, psd = signal.welch(ts, fs=0.5, nperseg=min(len(ts), 64))
+                freq_bands = [(0.01, 0.04), (0.04, 0.08), (0.08, 0.13)]
+                for low, high in freq_bands:
+                    idx = (freqs >= low) & (freqs <= high)
+                    feat.append(np.mean(psd[idx]) if np.any(idx) else 0)
+            except:
+                feat.extend([0, 0, 0])
 
             features.append(feat)
 
         features = np.array(features, dtype=np.float32)
-
-        # 处理NaN和Inf
-        features = np.nan_to_num(features, nan=0.0, posinf=0.0, neginf=0.0)
+        features = np.nan_to_num(features, 0)
 
         # 标准化
         scaler = StandardScaler()
@@ -271,29 +237,171 @@ class ABIDEDataProcessor:
 
         return torch.tensor(features, dtype=torch.float)
 
-    def process_and_save(self, n_subjects=None, graph_method='correlation_matrix'):
+    def extract_enhanced_features(self, time_series, adj_matrix):
         """
-        处理并保存ABIDE数据集为PyG格式
+        提取增强特征（统计 + 图拓扑）
 
         Args:
-            n_subjects: 处理的被试数量
-            graph_method: 图构建方法
+            time_series: [T, N]
+            adj_matrix: [N, N]
 
         Returns:
-            graph_list: PyG Data对象列表
+            features: [N, D+K]
         """
+        # 统计特征
+        stat_feat = self.extract_statistical_features(time_series)
+
+        # 图拓扑特征
+        N = time_series.shape[1]
+        G = nx.from_numpy_array(np.abs(adj_matrix))
+
+        degrees = dict(G.degree())
+        clustering = nx.clustering(G)
+
+        try:
+            betweenness = nx.betweenness_centrality(G)
+        except:
+            betweenness = {i: 0 for i in range(N)}
+
+        topo_feat = []
+        for i in range(N):
+            topo_feat.append([
+                degrees[i] / N,
+                clustering[i],
+                betweenness[i]
+            ])
+
+        topo_feat = torch.tensor(topo_feat, dtype=torch.float)
+
+        # 拼接
+        return torch.cat([stat_feat, topo_feat], dim=1)
+
+    # ==========================================
+    # 邻接矩阵构建
+    # ==========================================
+
+    def construct_anatomical_adj(self, n_regions=116):
+        """构建基于解剖的邻接矩阵"""
+        adj = np.zeros((n_regions, n_regions))
+
+        # AAL图谱的左右脑划分
+        if n_regions == 116:
+            left_indices = list(range(0, 45))
+            right_indices = list(range(45, 90))
+            midline_indices = list(range(90, 116))
+        elif n_regions == 111:  # HO
+            left_indices = list(range(0, 55))
+            right_indices = list(range(55, 110))
+            midline_indices = [110]
+        else:
+            # 默认划分
+            left_indices = list(range(0, n_regions // 2))
+            right_indices = list(range(n_regions // 2, n_regions))
+            midline_indices = []
+
+        # 双边图连接
+        for i in range(n_regions):
+            if i in left_indices:
+                adj[i, right_indices] = 1
+                adj[i, midline_indices] = 1
+            elif i in right_indices:
+                adj[i, left_indices] = 1
+                adj[i, midline_indices] = 1
+            else:
+                adj[i, left_indices] = 1
+                adj[i, right_indices] = 1
+
+        # 对称化
+        adj = (adj + adj.T) / 2
+        adj[adj > 0] = 1
+        np.fill_diagonal(adj, 0)
+
+        return adj
+
+    def construct_functional_adj(self, time_series, use_phase_sync=True):
+        """构建基于功能连接的邻接矩阵"""
+        # 相关矩阵
+        corr = np.corrcoef(time_series.T)
+        corr = np.nan_to_num(corr, 0)
+        np.fill_diagonal(corr, 0)
+
+        if use_phase_sync:
+            # 相位同步（ASD关键特征）
+            phase_sync = self._compute_phase_sync(time_series)
+            func_conn = (corr + phase_sync) / 2
+        else:
+            func_conn = corr
+
+        # 阈值化
+        threshold = np.percentile(np.abs(func_conn), 70)
+        adj = np.zeros_like(func_conn)
+        adj[np.abs(func_conn) > threshold] = func_conn[np.abs(func_conn) > threshold]
+
+        return adj
+
+    def _compute_phase_sync(self, time_series):
+        """计算相位同步矩阵"""
+        from scipy.signal import hilbert
+
+        n_regions = time_series.shape[1]
+        phase_sync = np.zeros((n_regions, n_regions))
+
+        try:
+            phases = np.angle(hilbert(time_series, axis=0))
+
+            for i in range(n_regions):
+                for j in range(i+1, n_regions):
+                    try:
+                        phase_diff = phases[:, i] - phases[:, j]
+                        plv = np.abs(np.mean(np.exp(1j * phase_diff)))
+                        phase_sync[i, j] = phase_sync[j, i] = plv
+                    except:
+                        pass
+        except:
+            pass
+
+        return phase_sync
+
+    # ==========================================
+    # 主处理函数：生成不同格式的数据
+    # ==========================================
+
+    def process_and_save(self,
+                        n_subjects=None,
+                        feature_type='temporal',
+                        graph_type='dual_stream',
+                        use_phase_sync=True):
+        """
+        统一的处理和保存函数
+
+        Args:
+            feature_type:
+                - 'temporal': 时序特征（用于SF-DPL）
+                - 'statistical': 统计特征（用于基线）
+                - 'enhanced': 统计+拓扑特征（用于基线）
+
+            graph_type:
+                - 'dual_stream': 双流图（结构+功能）
+                - 'single_functional': 单流功能图
+                - 'single_anatomical': 单流解剖图
+
+            use_phase_sync: 是否使用相位同步
+
+        Returns:
+            graph_list: 图数据列表
+        """
+        print(f"\n{'='*60}")
+        print(f"ABIDE数据处理")
+        print(f"特征类型: {feature_type}")
+        print(f"图类型: {graph_type}")
+        print(f"{'='*60}")
+
         # 下载数据
         data = self.download_data(n_subjects)
 
-        # 获取标签
-        phenotypic = data.phenotypic
-        labels = phenotypic['DX_GROUP'].values - 1  # 0: 控制组, 1: ASD
-
-        # 获取时间序列数据
+        # 获取ROI数据和标签
         rois_data = None
-
-        # 尝试不同的属性名
-        for attr in ['rois_ho', 'rois_cc200', 'rois_cc400', 'rois_aal', 'rois_ez', 'rois_dosenbach160']:
+        for attr in ['rois_ho', 'rois_cc200', 'rois_aal']:
             if hasattr(data, attr):
                 rois_data = getattr(data, attr)
                 if rois_data is not None:
@@ -301,525 +409,206 @@ class ABIDEDataProcessor:
                     break
 
         if rois_data is None:
-            print("错误：未找到ROI数据，请检查数据下载是否成功")
+            print("错误：未找到ROI数据")
             return []
 
+        labels = data.phenotypic['DX_GROUP'].values - 1
+
+        # 确定时间长度
+        target_length = self.determine_time_length(rois_data)
+        print(f"目标时间长度: {target_length}")
+
+        # 处理每个被试
         graph_list = []
-        valid_indices = []
 
-        print(f"正在构建脑功能图 (方法: {graph_method})...")
-        print(f"ROI数据数量: {len(rois_data)}")
-
-        for idx, roi_data in enumerate(rois_data):
+        for idx, roi_file in enumerate(rois_data):
             try:
-                # 处理不同的数据格式
-                if roi_data is None:
-                    print(f"跳过被试 {idx}: ROI数据为None")
-                    continue
-
-                # 检查是否是numpy数组（直接的时间序列数据）
-                if isinstance(roi_data, np.ndarray):
-                    time_series = roi_data
-                    print(f"处理被试 {idx}: 直接使用numpy数组")
-                # 检查是否是文件路径
-                elif isinstance(roi_data, str):
-                    if not os.path.exists(roi_data):
-                        print(f"跳过被试 {idx}: ROI文件不存在 ({roi_data})")
-                        continue
-                    print(f"处理被试 {idx}: 从文件加载 {roi_data}")
-                    # 加载时间序列
-                    time_series = pd.read_csv(roi_data, sep='\t', header=0).values
+                # 加载时间序列
+                if isinstance(roi_file, str) and os.path.exists(roi_file):
+                    time_series = pd.read_csv(roi_file, sep='\t', header=0).values
+                elif isinstance(roi_file, np.ndarray):
+                    time_series = roi_file
                 else:
-                    print(f"跳过被试 {idx}: 未知的数据类型 ({type(roi_data)})")
                     continue
 
-                print(f"  时间序列形状: {time_series.shape}")
+                # 处理到目标长度
+                time_series = self.process_time_series(time_series, target_length)
 
-                # 检查数据有效性
-                if time_series.shape[0] < 50:  # 时间点太少
-                    print(f"跳过被试 {idx}: 时间序列太短 ({time_series.shape[0]} < 50)")
+                if time_series.shape[0] < 50:
                     continue
 
-                # 构建图
-                edge_index, edge_attr, node_features = self.construct_brain_graph(
-                    time_series, method=graph_method
-                )
+                label = labels[idx]
 
-                # 创建PyG Data对象
-                data_obj = Data(
-                    x=node_features,
-                    edge_index=edge_index,
-                    edge_attr=edge_attr,
-                    y=torch.tensor([labels[idx]], dtype=torch.long)
-                )
+                # 根据配置生成图
+                if graph_type == 'dual_stream':
+                    graphs = self._create_dual_stream_graphs(
+                        time_series, label, feature_type, use_phase_sync
+                    )
+                elif graph_type == 'single_functional':
+                    graphs = self._create_single_graph(
+                        time_series, label, feature_type, 'functional', use_phase_sync
+                    )
+                elif graph_type == 'single_anatomical':
+                    graphs = self._create_single_graph(
+                        time_series, label, feature_type, 'anatomical', use_phase_sync
+                    )
+                else:
+                    continue
 
-                graph_list.append(data_obj)
-                valid_indices.append(idx)
+                graph_list.append(graphs)
 
-                if (idx + 1) % 50 == 0:
-                    print(f"已处理 {idx + 1}/{len(rois_data)} 个被试")
+                if (idx + 1) % 20 == 0:
+                    print(f"已处理: {idx + 1}/{len(rois_data)}")
 
             except Exception as e:
-                print(f"处理被试 {idx} 时出错: {e}")
-                import traceback
-                traceback.print_exc()
+                print(f"处理被试{idx}失败: {e}")
                 continue
 
-        print(f"成功构建 {len(graph_list)} 个脑功能图")
+        print(f"\n成功构建 {len(graph_list)} 个样本")
 
-        # 保存处理后的数据
+        # 保存
+        save_name = f'abide_{graph_type}_{feature_type}_{target_length}.pt'
+        save_path = os.path.join(self.processed_path, save_name)
+        torch.save(graph_list, save_path)
+        print(f"数据已保存至: {save_path}")
+
+        # 保存元信息
         if graph_list:
-            save_path = os.path.join(self.processed_path, f'abide_graphs_{graph_method}.pt')
-            torch.save(graph_list, save_path)
-            print(f"数据已保存到: {save_path}")
+            sample = graph_list[0]
+            if isinstance(sample, tuple):
+                sample = sample[0]
 
-            # 保存元信息
             meta_info = {
                 'n_subjects': len(graph_list),
-                'n_features': graph_list[0].x.shape[1] if graph_list else 0,
-                'graph_method': graph_method,
-                'atlas': self.atlas,
-                'pipeline': self.pipeline,
-                'valid_indices': valid_indices
+                'time_length': target_length,
+                'feature_type': feature_type,
+                'graph_type': graph_type,
+                'node_feature_dim': sample.x.shape[1],
+                'n_regions': sample.x.shape[0]
             }
 
-            meta_path = os.path.join(self.processed_path, f'meta_info_{graph_method}.pt')
+            meta_path = os.path.join(self.processed_path, 'meta_info.pt')
             torch.save(meta_info, meta_path)
-        else:
-            print("警告：没有成功构建任何图")
+            print(f"\n样本信息:")
+            print(f"  节点特征: {sample.x.shape}")
+            print(f"  边数: {sample.edge_index.shape[1]}")
 
         return graph_list
 
-    def load_processed_data(self, graph_method='correlation_matrix'):
-        """
-        加载已处理的数据
+    def _create_dual_stream_graphs(self, time_series, label, feature_type, use_phase_sync):
+        """创建双流图"""
+        N = time_series.shape[1]
 
-        Args:
-            graph_method: 图构建方法
+        # 构建邻接矩阵
+        struct_adj = self.construct_anatomical_adj(N)
+        func_adj = self.construct_functional_adj(time_series, use_phase_sync)
 
-        Returns:
-            graph_list: PyG Data对象列表
-        """
-        save_path = os.path.join(self.processed_path, f'abide_graphs_{graph_method}.pt')
-
-        if os.path.exists(save_path):
-            print(f"加载已处理的数据: {save_path}")
-            return torch.load(save_path)
-        else:
-            print("未找到已处理的数据，开始处理...")
-            return self.process_and_save(graph_method=graph_method)
-
-
-def load_abide_data(data_folder='./data', n_subjects=None, graph_method='correlation_matrix'):
-    """
-    便捷函数：加载ABIDE数据集
-
-    Args:
-        data_folder: 数据保存路径
-        n_subjects: 被试数量
-        graph_method: 图构建方法
-
-    Returns:
-        graph_list: 图数据列表
-        input_dim: 输入特征维度
-        output_dim: 输出类别数
-    """
-    processor = ABIDEDataProcessor(data_folder=data_folder)
-
-    # 尝试加载已处理的数据
-    graph_list = processor.load_processed_data(graph_method=graph_method)
-
-    if not graph_list:
-        # 如果没有已处理的数据，则重新处理
-        graph_list = processor.process_and_save(n_subjects=n_subjects, graph_method=graph_method)
-
-    if graph_list:
-        input_dim = graph_list[0].x.shape[1]
-        output_dim = 2  # 二分类：控制组 vs ASD
-    else:
-        input_dim = 0
-        output_dim = 2
-
-    return graph_list, input_dim, output_dim
-
-# 双流数据处理扩展
-class ABIDEDualStream:
-    """ABIDE双流数据处理扩展"""
-
-    def __init__(self, original_processor):
-        """基于原有ABIDE处理器扩展"""
-        self.processor = original_processor
-
-    def construct_dual_stream(self, time_series, label):
-        """为单个被试构建双流数据"""
-        # 功能流：多种连接矩阵融合
-        func_matrix = self._construct_functional_network(time_series)
-
-        # 结构流：稳定连接
-        struct_matrix = self._construct_structural_network(time_series)
-
-        # 节点特征
-        func_features = self._extract_functional_features(time_series)
-        struct_features = self._extract_structural_features(time_series)
+        # 提取节点特征
+        if feature_type == 'temporal':
+            node_features = self.extract_temporal_features(time_series)
+        elif feature_type == 'statistical':
+            node_features = self.extract_statistical_features(time_series)
+        elif feature_type == 'enhanced':
+            node_features = self.extract_enhanced_features(time_series, func_adj)
 
         # 转换为PyG格式
-        func_data = self._matrix_to_pyg(func_matrix, func_features, label)
-        struct_data = self._matrix_to_pyg(struct_matrix, struct_features, label)
+        struct_data = self._adj_to_pyg(struct_adj, node_features, label)
+        func_data = self._adj_to_pyg(func_adj, node_features, label, weighted=True)
 
-        return func_data, struct_data
+        return (func_data, struct_data)
 
-    def _construct_functional_network(self, time_series):
-        """构建功能网络（添加 nan 处理）"""
-        # 预处理时间序列
-        time_series = np.nan_to_num(time_series, nan=0.0, posinf=0.0, neginf=0.0)
+    def _create_single_graph(self, time_series, label, feature_type, adj_type, use_phase_sync):
+        """创建单流图"""
+        N = time_series.shape[1]
 
-        # 检查是否有全0列
-        for col in range(time_series.shape[1]):
-            if np.std(time_series[:, col]) < 1e-6:
-                time_series[:, col] = np.random.randn(time_series.shape[0]) * 0.01
+        # 构建邻接矩阵
+        if adj_type == 'functional':
+            adj = self.construct_functional_adj(time_series, use_phase_sync)
+        elif adj_type == 'anatomical':
+            adj = self.construct_anatomical_adj(N)
 
-        # 相关矩阵
-        try:
-            corr = np.corrcoef(time_series.T)
-            corr = np.nan_to_num(corr, nan=0.0, posinf=0.0, neginf=0.0)
-            np.fill_diagonal(corr, 0)
-        except:
-            corr = np.zeros((time_series.shape[1], time_series.shape[1]))
+        # 提取节点特征
+        if feature_type == 'temporal':
+            node_features = self.extract_temporal_features(time_series)
+        elif feature_type == 'statistical':
+            node_features = self.extract_statistical_features(time_series)
+        elif feature_type == 'enhanced':
+            node_features = self.extract_enhanced_features(time_series, adj)
 
-        # 偏相关（针对ASD）
-        try:
-            cov = LedoitWolf().fit(time_series)
-            precision = cov.precision_
-            diag = np.sqrt(np.diag(precision))
-            diag = np.where(diag < 1e-6, 1.0, diag)  # 避免除零
-            partial = -precision / np.outer(diag, diag)
-            partial = np.nan_to_num(partial, nan=0.0, posinf=0.0, neginf=0.0)
-            np.fill_diagonal(partial, 0)
-        except:
-            partial = corr.copy()
+        # 转换为PyG格式
+        return self._adj_to_pyg(adj, node_features, label, weighted=(adj_type=='functional'))
 
-        # 相位同步（针对ASD长程连接）
-        phase_sync = self._phase_synchronization(time_series)
-
-        # 融合：ASD特别关注相位同步
-        func_matrix = (corr + partial + phase_sync * 1.5) / 3.5
-        func_matrix = np.nan_to_num(func_matrix, nan=0.0, posinf=0.0, neginf=0.0)
-
-        # 阈值化
-        threshold = np.percentile(np.abs(func_matrix), 70)
-        func_matrix[np.abs(func_matrix) < threshold] = 0
-
-        return func_matrix
-
-    def _construct_structural_network(self, time_series):
-        """构建结构网络（伪）（添加 nan 处理）"""
-        # 预处理
-        time_series = np.nan_to_num(time_series, nan=0.0, posinf=0.0, neginf=0.0)
-
-        # 使用稳定的强连接
-        try:
-            corr = np.corrcoef(time_series.T)
-            corr = np.nan_to_num(corr, nan=0.0, posinf=0.0, neginf=0.0)
-        except:
-            corr = np.zeros((time_series.shape[1], time_series.shape[1]))
-
-        # 只保留最强连接
-        threshold = np.percentile(np.abs(corr), 95)
-        struct = np.zeros_like(corr)
-        struct[np.abs(corr) > threshold] = 1
-        np.fill_diagonal(struct, 0)
-
-        return struct
-
-    def _phase_synchronization(self, time_series):
-        """计算相位同步（ASD关键特征）（添加 nan 处理）"""
-        from scipy.signal import hilbert
-        n_regions = time_series.shape[1]
-        phase_sync = np.zeros((n_regions, n_regions))
-
-        for i in range(n_regions):
-            for j in range(i + 1, n_regions):
-                try:
-                    # 检查输入
-                    ts_i = time_series[:, i]
-                    ts_j = time_series[:, j]
-
-                    if np.isnan(ts_i).any() or np.isnan(ts_j).any():
-                        ts_i = np.nan_to_num(ts_i, nan=0.0)
-                        ts_j = np.nan_to_num(ts_j, nan=0.0)
-
-                    # 去除常数序列
-                    if np.std(ts_i) < 1e-6 or np.std(ts_j) < 1e-6:
-                        phase_sync[i, j] = phase_sync[j, i] = 0.0
-                        continue
-
-                    # Hilbert变换
-                    phase_i = np.angle(hilbert(ts_i))
-                    phase_j = np.angle(hilbert(ts_j))
-
-                    # 相位锁定值
-                    plv = np.abs(np.mean(np.exp(1j * (phase_i - phase_j))))
-
-                    if np.isnan(plv) or np.isinf(plv):
-                        plv = 0.0
-
-                    phase_sync[i, j] = phase_sync[j, i] = plv
-
-                except Exception as e:
-                    phase_sync[i, j] = phase_sync[j, i] = 0.0
-
-        # 最终检查
-        phase_sync = np.nan_to_num(phase_sync, nan=0.0, posinf=0.0, neginf=0.0)
-        return phase_sync
-
-    def _extract_functional_features(self, time_series):
-        """提取功能特征（添加 nan 处理）"""
-        features = []
-
-        for i in range(time_series.shape[1]):
-            ts = time_series[:, i]
-
-            # 检查并处理nan值
-            if np.isnan(ts).any():
-                ts = np.nan_to_num(ts, nan=0.0, posinf=0.0, neginf=0.0)
-
-            # 如果整个时间序列都是0或常数
-            if np.std(ts) < 1e-6:
-                ts = ts + np.random.randn(len(ts)) * 0.01
-
-            try:
-                feat = [
-                    np.mean(ts),
-                    np.std(ts) if np.std(ts) > 0 else 1e-6,
-                    stats.skew(ts) if not np.isnan(stats.skew(ts)) else 0.0,
-                    stats.kurtosis(ts) if not np.isnan(stats.kurtosis(ts)) else 0.0,
-                    np.percentile(ts, 25),
-                    np.percentile(ts, 75)
-                ]
-
-                # 频域特征
-                try:
-                    freqs, psd = signal.welch(ts, fs=0.5, nperseg=min(len(ts), 64))
-                    freq_bands = [(0.01, 0.04), (0.04, 0.08), (0.08, 0.13), (0.13, 0.30)]
-                    for low, high in freq_bands:
-                        idx = (freqs >= low) & (freqs <= high)
-                        if np.any(idx):
-                            band_power = np.mean(psd[idx])
-                            feat.append(band_power if not np.isnan(band_power) else 0.0)
-                        else:
-                            feat.append(0.0)
-                except:
-                    feat.extend([0.0] * 4)
-            except:
-                feat = [0.0] * 10
-
-            # 再次检查是否有nan
-            feat = [0.0 if np.isnan(f) or np.isinf(f) else f for f in feat]
-            features.append(feat)
-
-        features = np.array(features, dtype=np.float32)
-        features = np.nan_to_num(features, nan=0.0, posinf=0.0, neginf=0.0)
-
-        # 标准化（处理全0列）
-        from sklearn.preprocessing import StandardScaler
-        scaler = StandardScaler()
-
-        # 检查是否有全0或常数列
-        for col in range(features.shape[1]):
-            if np.std(features[:, col]) < 1e-6:
-                features[:, col] = np.random.randn(features.shape[0]) * 0.01
-
-        features = scaler.fit_transform(features)
-        features = np.nan_to_num(features, nan=0.0, posinf=0.0, neginf=0.0)
-
-        return torch.tensor(features, dtype=torch.float)
-
-    def _extract_structural_features(self, time_series):
-        """提取结构特征（简化版）（添加 nan 处理）"""
-        features = []
-
-        for i in range(time_series.shape[1]):
-            ts = time_series[:, i]
-
-            # 检查并处理nan值
-            if np.isnan(ts).any():
-                ts = np.nan_to_num(ts, nan=0.0, posinf=0.0, neginf=0.0)
-
-            # 如果整个时间序列都是0或常数
-            if np.std(ts) < 1e-6:
-                ts = ts + np.random.randn(len(ts)) * 0.01
-
-            try:
-                feat = [
-                    np.mean(ts),
-                    np.std(ts) if np.std(ts) > 0 else 1e-6,
-                    np.median(ts),
-                    np.ptp(ts) if np.ptp(ts) > 0 else 1e-6
-                ]
-            except:
-                feat = [0.0, 1.0, 0.0, 1.0]
-
-            # 检查nan
-            feat = [0.0 if np.isnan(f) or np.isinf(f) else f for f in feat]
-            features.append(feat)
-
-        features = np.array(features, dtype=np.float32)
-        features = np.nan_to_num(features, nan=0.0, posinf=0.0, neginf=0.0)
-
-        # 标准化
-        from sklearn.preprocessing import StandardScaler
-        scaler = StandardScaler()
-
-        # 检查全0列
-        for col in range(features.shape[1]):
-            if np.std(features[:, col]) < 1e-6:
-                features[:, col] = np.random.randn(features.shape[0]) * 0.01
-
-        features = scaler.fit_transform(features)
-        features = np.nan_to_num(features, nan=0.0, posinf=0.0, neginf=0.0)
-
-        return torch.tensor(features, dtype=torch.float)
-
-    def _matrix_to_pyg(self, matrix, features, label):
-        """转换为PyG Data对象（添加 nan 处理）"""
-        # 确保矩阵无nan
-        matrix = np.nan_to_num(matrix, nan=0.0, posinf=0.0, neginf=0.0)
-
+    def _adj_to_pyg(self, adj_matrix, node_features, label, weighted=False):
+        """转换为PyG Data格式"""
         edge_index = []
-        edge_attr = []
+        edge_attr = [] if weighted else None
 
-        n = matrix.shape[0]
-        for i in range(n):
-            for j in range(i + 1, n):
-                weight = matrix[i, j]
-                # 检查权重
-                if np.isnan(weight) or np.isinf(weight):
-                    weight = 0.0
-
-                if weight != 0:
-                    edge_index.extend([[i, j], [j, i]])
-                    edge_attr.extend([weight, weight])
-
-        # 如果没有边，添加自环
-        if len(edge_index) == 0:
-            for i in range(min(10, n)):
-                edge_index.extend([[i, i]])
-                edge_attr.extend([1.0])
+        N = adj_matrix.shape[0]
+        for i in range(N):
+            for j in range(N):
+                if adj_matrix[i, j] != 0:
+                    edge_index.append([i, j])
+                    if weighted:
+                        edge_attr.append(adj_matrix[i, j])
 
         edge_index = torch.tensor(edge_index, dtype=torch.long).t()
-        edge_attr = torch.tensor(edge_attr, dtype=torch.float)
 
-        # 再次检查
-        if torch.isnan(features).any():
-            features = torch.nan_to_num(features, nan=0.0, posinf=0.0, neginf=0.0)
-
-        if torch.isnan(edge_attr).any():
-            edge_attr = torch.nan_to_num(edge_attr, nan=0.0, posinf=0.0, neginf=0.0)
+        if weighted:
+            edge_attr = torch.tensor(edge_attr, dtype=torch.float)
 
         return Data(
-            x=features,
+            x=node_features,
             edge_index=edge_index,
             edge_attr=edge_attr,
             y=torch.tensor([label], dtype=torch.long)
         )
 
-# 在ABIDEDataProcessor类中添加双流处理方法
-def process_dual_stream(self):
-    """添加到ABIDEDataProcessor类的方法"""
-    dual_processor = ABIDEDualStream(self)
-    dual_stream_data = []
 
-    # 先加载数据
-    data = self.download_data(n_subjects=None)
+# ==========================================
+# 便捷函数
+# ==========================================
 
-    print("构建双流数据...")
+def prepare_all_data(data_folder='./data', n_subjects=None):
+    """一键准备所有格式的数据"""
 
-    # 检查不同的可能属性名
-    rois_data = None
-    for attr in ['rois_ho', 'rois_cc200', 'rois_cc400', 'rois_aal', 'rois_ez', 'rois_dosenbach160']:
-        if hasattr(data, attr):
-            rois_data = getattr(data, attr)
-            if rois_data is not None:
-                break
-
-    if rois_data is None:
-        print("未找到ROI数据")
-        return []
-
-    # 获取标签
-    labels = data.phenotypic['DX_GROUP'].values - 1
-
-    for idx, roi_file in enumerate(rois_data):
-        try:
-            if roi_file is None:
-                continue
-
-            # 处理不同格式的数据
-            if isinstance(roi_file, str) and os.path.exists(roi_file):
-                time_series = pd.read_csv(roi_file, sep='\t', header=0).values
-            elif isinstance(roi_file, np.ndarray):
-                time_series = roi_file
-            else:
-                continue
-
-            if time_series.shape[0] < 50:
-                continue
-
-            label = labels[idx]
-
-            # 构建双流
-            func_data, struct_data = dual_processor.construct_dual_stream(
-                time_series, label
-            )
-            dual_stream_data.append((func_data, struct_data))
-
-            if (idx + 1) % 10 == 0:
-                print(f"处理进度: {idx + 1}/{len(rois_data)}")
-
-        except Exception as e:
-            print(f"处理被试{idx}失败: {e}")
-            continue
-
-    print(f"成功构建{len(dual_stream_data)}个双流样本")
-
-    # 保存
-    save_path = os.path.join(self.processed_path, 'abide_dual_stream.pt')
-    torch.save(dual_stream_data, save_path)
-    print(f"数据已保存至: {save_path}")
-
-    return dual_stream_data
-
-
-# 为了兼容，在ABIDEDataProcessor类后添加
-ABIDEDataProcessor.process_dual_stream = process_dual_stream
-
-# 添加主函数，使文件可以直接运行
-if __name__ == "__main__":
-    print("=" * 60)
-    print("ABIDE数据集处理")
-    print("=" * 60)
-
-    # 创建处理器
     processor = ABIDEDataProcessor(
-        data_folder='./data',
-        pipeline='cpac',
-        atlas='ho',
-        connectivity_kind='correlation',
-        threshold=0.3
-
+        data_folder=data_folder,
+        time_strategy='adaptive'
     )
 
-    # 1. 下载和处理基础数据
-    print("\n1. 处理基础数据...")
-    graph_list = processor.process_and_save(
-        n_subjects=None,  # 处理所有被试
-        graph_method='correlation_matrix'
-    )
-    print(f"基础数据处理完成: {len(graph_list)} 个样本")
+    configs = [
+        # SF-DPL用：双流 + 时序特征
+        {'feature_type': 'temporal', 'graph_type': 'dual_stream', 'use_phase_sync': True},
 
-    # 2. 构建双流数据
-    print("\n2. 构建双流数据...")
-    dual_stream_data = processor.process_dual_stream()
-    print(f"双流数据构建完成: {len(dual_stream_data)} 个样本")
+        # 基线用：单流 + 统计特征
+        {'feature_type': 'statistical', 'graph_type': 'single_functional', 'use_phase_sync': True},
 
-    print("\n处理完成！")
+        # 基线用：单流 + 增强特征
+        {'feature_type': 'enhanced', 'graph_type': 'single_functional', 'use_phase_sync': True},
+    ]
+
+    results = {}
+
+    for config in configs:
+        name = f"{config['graph_type']}_{config['feature_type']}"
+        print(f"\n处理配置: {name}")
+
+        graph_list = processor.process_and_save(
+            n_subjects=n_subjects,
+            **config
+        )
+
+        results[name] = len(graph_list)
+
+    print(f"\n{'='*60}")
+    print("所有数据处理完成")
+    print(f"{'='*60}")
+    for name, count in results.items():
+        print(f"{name}: {count} 个样本")
+
+    return results
+
+
+if __name__ == "__main__":
+    # 一键准备所有数据
+    prepare_all_data(data_folder='./data', n_subjects=None)
