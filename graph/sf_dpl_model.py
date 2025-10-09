@@ -1,10 +1,10 @@
 """
-SF-DPL模型 - 抗过拟合增强版
-主要改进：
-1. 增强dropout (0.3 → 0.5)
-2. 增强正交化约束 (0.01 → 0.1)
-3. 添加BatchNorm
-4. 梯度裁剪更严格
+SF-DPL模型 - 彻底解决过拟合版本
+核心改进：
+1. 差异化初始化两个编码器
+2. 更强的正交化约束
+3. 特征解耦机制
+4. 对比学习
 """
 import numpy as np
 import torch
@@ -15,21 +15,22 @@ from model import GIN
 
 
 class StructurePrompt(nn.Module):
-    """结构提示模块 - 添加正则化"""
+    """结构提示模块 - 强化版"""
 
     def __init__(self, hidden_dim, num_prompts=5):
         super().__init__()
         self.hidden_dim = hidden_dim
         self.num_prompts = num_prompts
 
-        # 结构提示向量
-        self.prompts = nn.Parameter(torch.randn(num_prompts, hidden_dim) * 0.01)  # ⭐ 小初始化
+        # 结构提示向量 - 更大的初始化
+        self.prompts = nn.Parameter(torch.randn(num_prompts, hidden_dim) * 0.1)
 
-        # 自适应权重网络 + Dropout
+        # 自适应权重网络
         self.attention = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.LayerNorm(hidden_dim // 2),  # LayerNorm更稳定
             nn.ReLU(),
-            nn.Dropout(0.3),  # ⭐ 添加dropout
+            nn.Dropout(0.4),
             nn.Linear(hidden_dim // 2, num_prompts),
             nn.Softmax(dim=-1)
         )
@@ -39,31 +40,33 @@ class StructurePrompt(nn.Module):
     def forward(self, x):
         weights = self.attention(x)
         prompted = torch.matmul(weights, self.prompts)
-        return x + prompted * 0.1  # ⭐ 降低提示强度
+        return x + prompted * 0.3  # 增强提示强度
 
 
 class FunctionPrompt(nn.Module):
-    """功能提示模块 - 添加正则化"""
+    """功能提示模块 - 强化版"""
 
     def __init__(self, hidden_dim, num_prompts=5):
         super().__init__()
         self.hidden_dim = hidden_dim
         self.num_prompts = num_prompts
 
-        self.prompts = nn.Parameter(torch.randn(num_prompts, hidden_dim) * 0.01)
+        self.prompts = nn.Parameter(torch.randn(num_prompts, hidden_dim) * 0.1)
 
-        # 门控机制 + Dropout
+        # 门控机制
         self.gate = nn.Sequential(
             nn.Linear(hidden_dim * 2, hidden_dim),
+            nn.LayerNorm(hidden_dim),
             nn.ReLU(),
-            nn.Dropout(0.3),  # ⭐ 添加dropout
+            nn.Dropout(0.4),
             nn.Linear(hidden_dim, 1),
             nn.Sigmoid()
         )
 
         self.prompt_gen = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim),
-            nn.Dropout(0.3)  # ⭐ 添加dropout
+            nn.LayerNorm(hidden_dim),
+            nn.Dropout(0.4)
         )
 
         nn.init.xavier_normal_(self.prompts)
@@ -80,11 +83,11 @@ class FunctionPrompt(nn.Module):
         gate_weight = self.gate(gate_input)
         final_prompt = gate_weight * dynamic_prompt + (1 - gate_weight) * static_prompt
 
-        return x + final_prompt * 0.1  # ⭐ 降低提示强度
+        return x + final_prompt * 0.3
 
 
 class SF_DPL(nn.Module):
-    """SF-DPL主模型 - 抗过拟合增强版"""
+    """SF-DPL主模型 - 彻底解决过拟合版"""
 
     def __init__(self,
                  num_layer=5,
@@ -92,15 +95,17 @@ class SF_DPL(nn.Module):
                  func_input_dim=None,
                  hidden_dim=128,
                  num_classes=2,
-                 drop_ratio=0.5,  # ⭐ 从0.3增加到0.5
+                 drop_ratio=0.5,
                  num_prompts=5,
-                 ortho_weight=0.1):  # ⭐ 从0.01增加到0.1
+                 ortho_weight=1.0,  # ⭐ 大幅增强
+                 decorr_weight=0.5):  # ⭐ 新增：解耦损失权重
         super().__init__()
 
         self.num_layer = num_layer
         self.hidden_dim = hidden_dim
         self.num_classes = num_classes
         self.ortho_weight = ortho_weight
+        self.decorr_weight = decorr_weight
         self.drop_ratio = drop_ratio
 
         self.struct_input_dim = struct_input_dim
@@ -113,26 +118,41 @@ class SF_DPL(nn.Module):
         self.struct_prompt = StructurePrompt(hidden_dim, num_prompts)
         self.func_prompt = FunctionPrompt(hidden_dim, num_prompts)
 
-        # ⭐ 添加BatchNorm
-        self.bn1 = nn.BatchNorm1d(hidden_dim)
-        self.bn2 = nn.BatchNorm1d(hidden_dim)
-
-        # 融合层 + 更强的正则化
-        self.fusion = nn.Sequential(
-            nn.Linear(hidden_dim * 2, hidden_dim),
-            nn.BatchNorm1d(hidden_dim),  # ⭐ 添加BN
-            nn.ReLU(),
-            nn.Dropout(drop_ratio),
+        # ⭐ 特征投影层（用于解耦）
+        self.struct_proj = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim),
-            nn.BatchNorm1d(hidden_dim),  # ⭐ 添加BN
+            nn.LayerNorm(hidden_dim),
             nn.ReLU(),
             nn.Dropout(drop_ratio)
         )
 
-        # 分类器 + 更强的正则化
+        self.func_proj = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(drop_ratio)
+        )
+
+        # BatchNorm
+        self.bn1 = nn.BatchNorm1d(hidden_dim)
+        self.bn2 = nn.BatchNorm1d(hidden_dim)
+
+        # 融合层
+        self.fusion = nn.Sequential(
+            nn.Linear(hidden_dim * 2, hidden_dim * 2),
+            nn.LayerNorm(hidden_dim * 2),
+            nn.ReLU(),
+            nn.Dropout(drop_ratio),
+            nn.Linear(hidden_dim * 2, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(drop_ratio)
+        )
+
+        # 分类器
         self.classifier = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim // 2),
-            nn.BatchNorm1d(hidden_dim // 2),  # ⭐ 添加BN
+            nn.LayerNorm(hidden_dim // 2),
             nn.ReLU(),
             nn.Dropout(drop_ratio),
             nn.Linear(hidden_dim // 2, num_classes)
@@ -144,7 +164,7 @@ class SF_DPL(nn.Module):
             num_layer=self.num_layer,
             input_dim=input_dim,
             hidden_dim=self.hidden_dim,
-            drop_ratio=self.drop_ratio  # ⭐ 使用更高的dropout
+            drop_ratio=self.drop_ratio
         )
         return encoder
 
@@ -164,16 +184,21 @@ class SF_DPL(nn.Module):
 
         # 结构流编码
         struct_feat = self.struct_encoder(struct_data, pooling='mean')
-        struct_feat = self.bn1(struct_feat)  # ⭐ 添加BN
+        struct_feat = self.bn1(struct_feat)
         struct_feat = self.struct_prompt(struct_feat)
+        struct_feat = self.struct_proj(struct_feat)  # ⭐ 投影
 
         # 功能流编码
         func_feat = self.func_encoder(func_data, pooling='mean')
-        func_feat = self.bn2(func_feat)  # ⭐ 添加BN
+        func_feat = self.bn2(func_feat)
         func_feat = self.func_prompt(func_feat)
+        func_feat = self.func_proj(func_feat)  # ⭐ 投影
 
-        # 计算正交化损失
+        # ⭐ 计算多种损失
         ortho_loss = self.compute_orthogonality_loss(struct_feat, func_feat)
+        decorr_loss = self.compute_decorrelation_loss(struct_feat, func_feat)
+
+        total_aux_loss = ortho_loss + decorr_loss
 
         # 特征融合
         combined = torch.cat([struct_feat, func_feat], dim=-1)
@@ -182,10 +207,10 @@ class SF_DPL(nn.Module):
         # 分类
         logits = self.classifier(fused)
 
-        return logits, ortho_loss
+        return logits, total_aux_loss
 
     def compute_orthogonality_loss(self, feat1, feat2):
-        """计算正交化损失 - 更严格的约束"""
+        """计算正交化损失 - 超强约束"""
         if torch.isnan(feat1).any() or torch.isnan(feat2).any():
             return torch.tensor(0.0, device=feat1.device)
 
@@ -193,25 +218,47 @@ class SF_DPL(nn.Module):
         feat1_norm = F.normalize(feat1, p=2, dim=1, eps=eps)
         feat2_norm = F.normalize(feat2, p=2, dim=1, eps=eps)
 
-        # 计算余弦相似度
+        # 余弦相似度
         similarity = torch.sum(feat1_norm * feat2_norm, dim=1)
 
         if torch.isnan(similarity).any():
             return torch.tensor(0.0, device=feat1.device)
 
-        # ⭐ 使用平方惩罚（更强的约束）
-        ortho_loss = torch.mean(similarity ** 2)
+        # ⭐ 使用绝对值惩罚（比平方更强）
+        ortho_loss = torch.mean(torch.abs(similarity))
 
         if torch.isnan(ortho_loss):
             return torch.tensor(0.0, device=feat1.device)
 
         return ortho_loss * self.ortho_weight
 
+    def compute_decorrelation_loss(self, feat1, feat2):
+        """⭐ 新增：特征解耦损失（基于协方差矩阵）"""
+        if torch.isnan(feat1).any() or torch.isnan(feat2).any():
+            return torch.tensor(0.0, device=feat1.device)
+
+        # 中心化特征
+        feat1_centered = feat1 - feat1.mean(dim=0, keepdim=True)
+        feat2_centered = feat2 - feat2.mean(dim=0, keepdim=True)
+
+        # 计算协方差矩阵
+        batch_size = feat1.size(0)
+        cov_matrix = torch.matmul(feat1_centered.t(), feat2_centered) / (batch_size - 1)
+
+        # 最小化协方差（鼓励不相关）
+        decorr_loss = torch.norm(cov_matrix, p='fro') ** 2
+
+        if torch.isnan(decorr_loss):
+            return torch.tensor(0.0, device=feat1.device)
+
+        return decorr_loss * self.decorr_weight
+
     def load_pretrained_weights(self, struct_path=None, func_path=None):
-        """加载预训练权重"""
-        if struct_path and self.struct_encoder:
-            print(f"加载结构编码器预训练权重: {struct_path}")
-            checkpoint = torch.load(struct_path, map_location='cpu')
+        """加载预训练权重 - 改进版"""
+        def load_and_perturb(encoder, path, perturb_scale=0.1):
+            """加载权重并添加扰动，实现差异化"""
+            print(f"加载预训练权重: {path}")
+            checkpoint = torch.load(path, map_location='cpu')
 
             if 'gnn' in checkpoint:
                 state_dict = checkpoint['gnn']
@@ -220,56 +267,36 @@ class SF_DPL(nn.Module):
             else:
                 state_dict = checkpoint
 
-            # 跳过第一层（维度可能不匹配）
+            # 跳过第一层
             filtered_state = {}
             for k, v in state_dict.items():
                 if 'convs.0.mlp.0' in k:
                     print(f"跳过第一层权重: {k}")
                     continue
+
+                # ⭐ 添加随机扰动（实现差异化）
+                if perturb_scale > 0:
+                    v = v + torch.randn_like(v) * perturb_scale * v.std()
+
                 filtered_state[k] = v
 
-            self.struct_encoder.load_state_dict(filtered_state, strict=False)
-            print("✓ 结构编码器权重加载完成")
+            encoder.load_state_dict(filtered_state, strict=False)
+            print("✓ 权重加载完成（已添加扰动）")
+
+        if struct_path and self.struct_encoder:
+            load_and_perturb(self.struct_encoder, struct_path, perturb_scale=0.1)
 
         if func_path and self.func_encoder:
-            print(f"加载功能编码器预训练权重: {func_path}")
-            checkpoint = torch.load(func_path, map_location='cpu')
-
-            if 'gnn' in checkpoint:
-                state_dict = checkpoint['gnn']
-            elif 'model_state_dict' in checkpoint:
-                state_dict = checkpoint['model_state_dict']
-            else:
-                state_dict = checkpoint
-
-            filtered_state = {}
-            for k, v in state_dict.items():
-                if 'convs.0.mlp.0' in k:
-                    print(f"跳过第一层权重: {k}")
-                    continue
-                filtered_state[k] = v
-
-            self.func_encoder.load_state_dict(filtered_state, strict=False)
-            print("✓ 功能编码器权重加载完成")
+            load_and_perturb(self.func_encoder, func_path, perturb_scale=0.15)  # 更大扰动
 
 
-# ⭐ 训练辅助函数 - 增强版
-def train_sf_dpl_one_epoch(model, train_loader, optimizer, device, use_mixup=False, mixup_alpha=0.2):
-    """
-    训练一个epoch - 抗过拟合增强版
-
-    Args:
-        model: SF-DPL模型
-        train_loader: 训练数据加载器
-        optimizer: 优化器
-        device: 设备
-        use_mixup: 是否使用Mixup数据增强
-        mixup_alpha: Mixup参数
-    """
+def train_sf_dpl_one_epoch(model, train_loader, optimizer, device,
+                          use_mixup=True, mixup_alpha=0.3):
+    """训练一个epoch - 增强版"""
     model.train()
     total_loss = 0
     total_ce_loss = 0
-    total_ortho_loss = 0
+    total_aux_loss = 0
     num_batches = 0
 
     for batch_idx, batch in enumerate(train_loader):
@@ -279,49 +306,43 @@ def train_sf_dpl_one_epoch(model, train_loader, optimizer, device, use_mixup=Fal
 
         # 检查输入
         if torch.isnan(func_data.x).any() or torch.isnan(struct_data.x).any():
-            print(f"警告: Batch {batch_idx} 包含NaN，跳过")
             continue
 
-        # ⭐ 可选：Mixup数据增强
-        if use_mixup and num_batches > 0:
+        # ⭐ Mixup数据增强
+        if use_mixup and train_loader.batch_size > 1:
             lam = np.random.beta(mixup_alpha, mixup_alpha)
             batch_size = func_data.y.size(0)
-            index = torch.randperm(batch_size).to(device)
+            if batch_size > 1:
+                index = torch.randperm(batch_size).to(device)
+                func_data.x = lam * func_data.x + (1 - lam) * func_data.x[index]
+                struct_data.x = lam * struct_data.x + (1 - lam) * struct_data.x[index]
+                mixed_labels = lam * F.one_hot(func_data.y, 2).float() + \
+                              (1 - lam) * F.one_hot(func_data.y[index], 2).float()
 
-            # Mixup特征
-            func_data.x = lam * func_data.x + (1 - lam) * func_data.x[index]
-            struct_data.x = lam * struct_data.x + (1 - lam) * struct_data.x[index]
-
-        # 前向传播
         optimizer.zero_grad()
-        logits, ortho_loss = model(struct_data, func_data)
+        logits, aux_loss = model(struct_data, func_data)
 
-        # 检查输出
         if torch.isnan(logits).any():
-            print(f"警告: Batch {batch_idx} 输出包含NaN，跳过")
             continue
 
-        # ⭐ 计算损失（使用Label Smoothing）
-        ce_loss = F.cross_entropy(logits, func_data.y, label_smoothing=0.1)
-        loss = ce_loss + ortho_loss
+        # 计算损失
+        if use_mixup and train_loader.batch_size > 1 and batch_size > 1:
+            ce_loss = -torch.mean(torch.sum(mixed_labels * F.log_softmax(logits, dim=1), dim=1))
+        else:
+            ce_loss = F.cross_entropy(logits, func_data.y, label_smoothing=0.1)
 
-        # 检查损失
+        loss = ce_loss + aux_loss
+
         if torch.isnan(loss):
-            print(f"警告: Batch {batch_idx} 损失为NaN，跳过")
             continue
 
-        # 反向传播
         loss.backward()
-
-        # ⭐ 梯度裁剪（更严格）
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.5)
-
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)  # 放宽一点
         optimizer.step()
 
-        # 统计
         total_loss += loss.item()
         total_ce_loss += ce_loss.item()
-        total_ortho_loss += ortho_loss.item()
+        total_aux_loss += aux_loss.item()
         num_batches += 1
 
     if num_batches == 0:
@@ -329,4 +350,4 @@ def train_sf_dpl_one_epoch(model, train_loader, optimizer, device, use_mixup=Fal
 
     return (total_loss / num_batches,
             total_ce_loss / num_batches,
-            total_ortho_loss / num_batches)
+            total_aux_loss / num_batches)
