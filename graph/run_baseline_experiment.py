@@ -69,11 +69,11 @@ def load_fc_data(dataset_name, data_folder='./data'):
     """
     if dataset_name == 'ABIDE':
         from abide_data_baseline import load_abide_baseline
-        fc_matrices, labels, subject_ids, meta = load_abide_baseline(data_folder)
+        fc_matrices, labels, subject_ids, site_ids, meta = load_abide_baseline(data_folder)
 
     elif dataset_name == 'MDD':
         from mdd_data_baseline import load_mdd_baseline
-        fc_matrices, labels, subject_ids, meta = load_mdd_baseline(data_folder)
+        fc_matrices, labels, subject_ids, site_ids, meta = load_mdd_baseline(data_folder)
 
     else:
         raise ValueError(f"Unknown dataset: {dataset_name}")
