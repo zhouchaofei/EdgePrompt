@@ -669,7 +669,7 @@ class GraphTask():
 
 
 class SF_DPL_Task:
-    """SF-DPL下游任务 - 抗过拟合增强版"""
+    """SF-DPL下游任务 - 改进版"""
 
     def __init__(self,
                  dataset_name,
@@ -681,7 +681,7 @@ class SF_DPL_Task:
                  pretrain_source='same',
                  num_layer=5,
                  hidden_dim=128,
-                 drop_ratio=0.5,
+                 drop_ratio=0.3,
                  num_prompts=5,
                  epochs=100,
                  lr=0.001):
@@ -714,7 +714,7 @@ class SF_DPL_Task:
         self.logger.info(f"  结构流: {struct_input_dim}")
         self.logger.info(f"  功能流: {func_input_dim}")
 
-        # 初始化SF-DPL模型（使用新版本）
+        # 初始化模型
         from sf_dpl_model import SF_DPL
 
         self.model = SF_DPL(
@@ -725,22 +725,22 @@ class SF_DPL_Task:
             num_classes=2,
             drop_ratio=drop_ratio,
             num_prompts=num_prompts,
-            ortho_weight=1.0,  # ⭐ 大幅增强
-            decorr_weight=0.5  # ⭐ 新增解耦损失
+            ortho_weight=0.01,  # ⭐ 关键：降低权重
+            decorr_weight=0.005
         ).to(device)
 
-        # ⭐ 差异化加载预训练权重
-        self.load_pretrained_weights_differently()
+        # 加载预训练权重
+        self.load_pretrained_weights()
 
-        # ⭐ 优化器：使用AdamW（更好的权重衰减）
+        # ⭐ 使用AdamW优化器（更好的权重衰减）
         self.optimizer = torch.optim.AdamW(
             self.model.parameters(),
             lr=lr,
-            weight_decay=1e-3,  # 更强的L2正则化
+            weight_decay=1e-4,  # 添加L2正则化
             betas=(0.9, 0.999)
         )
 
-        # ⭐ 学习率调度：Cosine Annealing + Warmup
+        # ⭐ 学习率调度器：Warmup + CosineAnnealing
         self.warmup_epochs = 10
         self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
             self.optimizer,
@@ -755,8 +755,8 @@ class SF_DPL_Task:
         self.logger.info(f"  总参数量: {total_params:,}")
         self.logger.info(f"  可训练参数: {trainable_params:,}")
 
-    def load_pretrained_weights_differently(self):
-        """⭐ 差异化加载预训练权重"""
+    def load_pretrained_weights(self):
+        """加载预训练权重 - 改进版"""
         if self.pretrain_task is None or self.pretrain_task == 'None':
             self.logger.info("不使用预训练模型")
             return
@@ -846,29 +846,15 @@ class SF_DPL_Task:
         for i in range(0, len(self.train_data), batch_size):
             batch_data = self.train_data[i:i + batch_size]
 
-            # 数据增强：添加噪声
-            func_list = []
-            struct_list = []
-
-            for func_data, struct_data in batch_data:
-                func_aug = func_data.clone()
-                struct_aug = struct_data.clone()
-
-                # 训练时添加高斯噪声
-                if self.model.training:
-                    noise_level = 0.02
-                    func_aug.x = func_aug.x + torch.randn_like(func_aug.x) * noise_level
-                    struct_aug.x = struct_aug.x + torch.randn_like(struct_aug.x) * noise_level
-
-                func_list.append(func_aug)
-                struct_list.append(struct_aug)
+            func_list = [d[0] for d in batch_data]
+            struct_list = [d[1] for d in batch_data]
 
             func_batch = Batch.from_data_list(func_list).to(self.device)
             struct_batch = Batch.from_data_list(struct_list).to(self.device)
 
-            # 检查输入数据
+            # 检查输入
             if torch.isnan(func_batch.x).any() or torch.isnan(struct_batch.x).any():
-                self.logger.warning("检测到输入数据中有nan，跳过该batch")
+                self.logger.warning("检测到输入中有nan，跳过该batch")
                 continue
 
             self.optimizer.zero_grad()
@@ -879,8 +865,7 @@ class SF_DPL_Task:
                 self.logger.warning("检测到输出中有nan，跳过该batch")
                 continue
 
-            # Label Smoothing
-            ce_loss = F.cross_entropy(output, func_batch.y, label_smoothing=0.1)
+            ce_loss = F.cross_entropy(output, func_batch.y)
             loss = ce_loss + aux_loss
 
             # 检查损失
@@ -889,10 +874,7 @@ class SF_DPL_Task:
                 continue
 
             loss.backward()
-
-            # 梯度裁剪
             torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
-
             self.optimizer.step()
 
             total_loss += loss.item()
@@ -908,7 +890,7 @@ class SF_DPL_Task:
                 total_aux_loss / num_batches)
 
     def evaluate(self):
-        """评估（返回多个指标）"""
+        """评估 - 返回多个指标"""
         from torch_geometric.data import Batch
         from sklearn.metrics import (accuracy_score, f1_score, roc_auc_score,
                                      precision_score, recall_score)
@@ -980,14 +962,14 @@ class SF_DPL_Task:
         best_f1 = 0
         best_epoch = 0
         patience = 0
-        max_patience = 20  # ⭐ 增加耐心
+        max_patience = 20
 
-        self.logger.info("\\n" + "=" * 80)
+        self.logger.info("\n" + "=" * 80)
         self.logger.info("开始训练SF-DPL模型（改进版）")
         self.logger.info("=" * 80)
 
         for epoch in range(epochs):
-            # ⭐ Warmup阶段
+            # ⭐ Warmup学习率
             if epoch < self.warmup_epochs:
                 warmup_factor = (epoch + 1) / self.warmup_epochs
                 for param_group in self.optimizer.param_groups:
@@ -1057,7 +1039,7 @@ class SF_DPL_Task:
             self.logger.info(f"最佳模型性能: Acc={final_metrics['accuracy']:.4f}, "
                              f"F1={final_metrics['f1']:.4f}, AUC={final_metrics['auc']:.4f}")
 
-        self.logger.info("\\n" + "=" * 80)
+        self.logger.info("\n" + "=" * 80)
         self.logger.info(f"训练完成！最佳准确率: {best_acc:.4f} (Epoch {best_epoch})")
         self.logger.info(f"最佳F1分数: {best_f1:.4f}")
         self.logger.info("=" * 80)
@@ -1190,11 +1172,11 @@ if __name__ == '__main__':
         all_results_acc = []
         all_results_f1 = []
 
-        for seed_idx in range(args.num_seeds):
-            seed = args.start_seed + seed_idx
+        for seed_idx in range(5):  # 运行5个不同的随机种子
+            seed = seed_idx
 
             print(f"\n{'=' * 80}")
-            print(f"运行 Seed {seed} ({seed_idx + 1}/{args.num_seeds})")
+            print(f"运行 Seed {seed} ({seed_idx + 1}/5)")
             print(f"{'=' * 80}")
 
             # 设置随机种子
@@ -1209,7 +1191,7 @@ if __name__ == '__main__':
             formatter = logging.Formatter('%(asctime)s - %(message)s')
             logger = Logger(log_file, formatter)
 
-            # ⭐ 创建SF_DPL任务
+            # 创建任务
             task = SF_DPL_Task(
                 args.dataset_name,
                 args.shots,
@@ -1247,7 +1229,7 @@ if __name__ == '__main__':
         print(f"F1分数: {mean_f1:.4f} ± {std_f1:.4f}")
         print(f"{'=' * 80}\n")
 
-        # 保存结果到文件
+        # 保存结果
         result_dir = os.path.join('results', args.dataset_name)
         os.makedirs(result_dir, exist_ok=True)
 
