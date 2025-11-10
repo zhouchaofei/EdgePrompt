@@ -294,7 +294,8 @@ def main():
     # 时序编码特征（可选）
     if not args.skip_temporal:
         temporal_features, temporal_dim = extract_all_features(
-            timeseries_list, labels,
+            timeseries_list,
+            labels=None,
             feature_type='temporal',
             embedding_dim=args.embedding_dim,
             device=args.device
