@@ -293,14 +293,25 @@ def main():
 
     # 时序编码特征（可选）
     if not args.skip_temporal:
-        temporal_features, temporal_dim = extract_all_features(
+        # 改为使用预训练encoder
+        from extract_node_features import extract_node_features_pretrained
+
+        encoder_path = f'./pretrained_models/{args.dataset}_node_encoder.pth'
+        temporal_features = extract_node_features_pretrained(
             timeseries_list,
-            labels=None,
-            feature_type='temporal',
+            encoder_path=encoder_path,
             embedding_dim=args.embedding_dim,
             device=args.device
         )
         features_dict['temporal'] = np.array(temporal_features)
+        # temporal_features, temporal_dim = extract_all_features(
+        #     timeseries_list,
+        #     labels=None,
+        #     feature_type='temporal',
+        #     embedding_dim=args.embedding_dim,
+        #     device=args.device
+        # )
+        # features_dict['temporal'] = np.array(temporal_features)
 
     # 4. 保存数据
     saved_files = save_gnn_dataset(
