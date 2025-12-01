@@ -14,7 +14,7 @@ class SimpleGNN(nn.Module):
 
     def __init__(self, input_dim, hidden_dim=64, output_dim=2,
                  num_layers=2, gnn_type='gcn', dropout=0.5,
-                 pooling='mean'):
+                 pooling='mean', num_rois=116):  # 🔥 新增 num_rois 参数
         """
         Args:
             input_dim: 节点特征维度
@@ -23,7 +23,8 @@ class SimpleGNN(nn.Module):
             num_layers: GNN层数
             gnn_type: GNN类型 ('gcn', 'gat', 'sage')
             dropout: dropout比率
-            pooling: 图池化方式 ('mean', 'max', 'mean_max')
+            pooling: 图池化方式 ('mean', 'max', 'mean_max', 'flatten')
+            num_rois: ROI数量（用于flatten pooling）
         """
         super().__init__()
 
@@ -31,6 +32,7 @@ class SimpleGNN(nn.Module):
         self.gnn_type = gnn_type
         self.pooling = pooling
         self.dropout = dropout
+        self.num_rois = num_rois  # 🔥 保存 num_rois
 
         # GNN层
         self.convs = nn.ModuleList()
@@ -43,7 +45,6 @@ class SimpleGNN(nn.Module):
             if gnn_type == 'gcn':
                 self.convs.append(GCNConv(in_dim, out_dim))
             elif gnn_type == 'gat':
-                # GAT with 4 attention heads
                 self.convs.append(GATConv(in_dim, out_dim // 4, heads=4, concat=True))
             elif gnn_type == 'sage':
                 self.convs.append(SAGEConv(in_dim, out_dim))
@@ -52,10 +53,13 @@ class SimpleGNN(nn.Module):
 
             self.batch_norms.append(nn.BatchNorm1d(out_dim))
 
-        # 分类器
-        classifier_input_dim = hidden_dim
-        if pooling == 'mean_max':
+        # 🔥 根据pooling方式确定分类器输入维度
+        if pooling == 'flatten':
+            classifier_input_dim = hidden_dim * num_rois  # 例如: 64 * 116 = 7424
+        elif pooling == 'mean_max':
             classifier_input_dim = hidden_dim * 2
+        else:  # 'mean' or 'max'
+            classifier_input_dim = hidden_dim
 
         self.classifier = nn.Sequential(
             nn.Linear(classifier_input_dim, hidden_dim),
@@ -74,13 +78,18 @@ class SimpleGNN(nn.Module):
         """
         x, edge_index, batch = data.x, data.edge_index, data.batch
 
-        # 如果有边权重，使用它
-        edge_weight = data.edge_attr.squeeze() if hasattr(data, 'edge_attr') and data.edge_attr is not None else None
+        # 使用边权重
+        if hasattr(data, 'edge_attr') and data.edge_attr is not None:
+            edge_weight = data.edge_attr.squeeze()
+            if torch.isnan(edge_weight).any() or torch.isinf(edge_weight).any():
+                print("⚠️ 检测到NaN/Inf边权重，替换为0")
+                edge_weight = torch.nan_to_num(edge_weight, nan=0.0, posinf=0.0, neginf=0.0)
+        else:
+            edge_weight = None
 
         # GNN layers
         for i in range(self.num_layers):
             if self.gnn_type == 'gat':
-                # GAT不支持edge_weight
                 x = self.convs[i](x, edge_index)
             else:
                 x = self.convs[i](x, edge_index, edge_weight=edge_weight)
@@ -89,8 +98,14 @@ class SimpleGNN(nn.Module):
             x = F.relu(x)
             x = F.dropout(x, p=self.dropout, training=self.training)
 
-        # Graph pooling
-        if self.pooling == 'mean':
+        # 🔥 Graph pooling/readout
+        if self.pooling == 'flatten':
+            # 将每个图的所有节点特征展平
+            batch_size = int(batch.max().item() + 1)
+            # 确保节点按batch顺序排列（PyG标准行为）
+            x = x.view(batch_size, self.num_rois * x.size(1))  # [batch_size, num_rois * hidden_dim]
+
+        elif self.pooling == 'mean':
             x = global_mean_pool(x, batch)
         elif self.pooling == 'max':
             x = global_max_pool(x, batch)
@@ -108,20 +123,26 @@ class SimpleGNN(nn.Module):
 class LinearProbe(nn.Module):
     """线性探针模型（用于快速验证特征质量）"""
 
-    def __init__(self, input_dim, output_dim=2, pooling='mean'):
+    def __init__(self, input_dim, output_dim=2, pooling='mean', num_rois=116):  # 🔥 新增 num_rois
         """
         Args:
             input_dim: 节点特征维度
             output_dim: 输出类别数
             pooling: 图池化方式
+            num_rois: ROI数量（用于flatten pooling）
         """
         super().__init__()
 
         self.pooling = pooling
+        self.num_rois = num_rois  # 🔥 保存 num_rois
 
-        classifier_input_dim = input_dim
-        if pooling == 'mean_max':
+        # 🔥 根据pooling方式确定分类器输入维度
+        if pooling == 'flatten':
+            classifier_input_dim = input_dim * num_rois
+        elif pooling == 'mean_max':
             classifier_input_dim = input_dim * 2
+        else:
+            classifier_input_dim = input_dim
 
         self.classifier = nn.Linear(classifier_input_dim, output_dim)
 
@@ -135,8 +156,12 @@ class LinearProbe(nn.Module):
         """
         x, batch = data.x, data.batch
 
-        # Graph pooling
-        if self.pooling == 'mean':
+        # 🔥 Graph pooling
+        if self.pooling == 'flatten':
+            batch_size = int(batch.max().item() + 1)
+            x = x.view(batch_size, self.num_rois * x.size(1))
+
+        elif self.pooling == 'mean':
             x = global_mean_pool(x, batch)
         elif self.pooling == 'max':
             x = global_max_pool(x, batch)
@@ -155,7 +180,7 @@ class MLPProbe(nn.Module):
     """MLP探针模型（稍复杂的baseline）"""
 
     def __init__(self, input_dim, hidden_dim=128, output_dim=2,
-                 dropout=0.5, pooling='mean'):
+                 dropout=0.5, pooling='mean', num_rois=116):  # 🔥 新增 num_rois
         """
         Args:
             input_dim: 节点特征维度
@@ -163,14 +188,20 @@ class MLPProbe(nn.Module):
             output_dim: 输出类别数
             dropout: dropout比率
             pooling: 图池化方式
+            num_rois: ROI数量（用于flatten pooling）
         """
         super().__init__()
 
         self.pooling = pooling
+        self.num_rois = num_rois  # 🔥 保存 num_rois
 
-        classifier_input_dim = input_dim
-        if pooling == 'mean_max':
+        # 🔥 根据pooling方式确定分类器输入维度
+        if pooling == 'flatten':
+            classifier_input_dim = input_dim * num_rois
+        elif pooling == 'mean_max':
             classifier_input_dim = input_dim * 2
+        else:
+            classifier_input_dim = input_dim
 
         self.classifier = nn.Sequential(
             nn.Linear(classifier_input_dim, hidden_dim),
@@ -192,8 +223,12 @@ class MLPProbe(nn.Module):
         """
         x, batch = data.x, data.batch
 
-        # Graph pooling
-        if self.pooling == 'mean':
+        # 🔥 Graph pooling
+        if self.pooling == 'flatten':
+            batch_size = int(batch.max().item() + 1)
+            x = x.view(batch_size, self.num_rois * x.size(1))
+
+        elif self.pooling == 'mean':
             x = global_mean_pool(x, batch)
         elif self.pooling == 'max':
             x = global_max_pool(x, batch)
@@ -209,7 +244,8 @@ class MLPProbe(nn.Module):
 
 
 def create_model(model_type, input_dim, hidden_dim=64, output_dim=2,
-                 num_layers=2, gnn_type='gcn', dropout=0.5, pooling='mean'):
+                 num_layers=2, gnn_type='gcn', dropout=0.5, pooling='mean',
+                 num_rois=116):  # 🔥 新增 num_rois 参数
     """
     创建模型的工厂函数
 
@@ -221,7 +257,8 @@ def create_model(model_type, input_dim, hidden_dim=64, output_dim=2,
         num_layers: GNN层数
         gnn_type: GNN类型
         dropout: dropout比率
-        pooling: 池化方式
+        pooling: 池化方式 ('mean', 'max', 'mean_max', 'flatten')
+        num_rois: ROI数量
 
     Returns:
         model: PyTorch模型
@@ -230,7 +267,8 @@ def create_model(model_type, input_dim, hidden_dim=64, output_dim=2,
         model = LinearProbe(
             input_dim=input_dim,
             output_dim=output_dim,
-            pooling=pooling
+            pooling=pooling,
+            num_rois=num_rois  # 🔥 传递参数
         )
     elif model_type == 'mlp':
         model = MLPProbe(
@@ -238,7 +276,8 @@ def create_model(model_type, input_dim, hidden_dim=64, output_dim=2,
             hidden_dim=hidden_dim,
             output_dim=output_dim,
             dropout=dropout,
-            pooling=pooling
+            pooling=pooling,
+            num_rois=num_rois  # 🔥 传递参数
         )
     elif model_type == 'gnn':
         model = SimpleGNN(
@@ -248,47 +287,10 @@ def create_model(model_type, input_dim, hidden_dim=64, output_dim=2,
             num_layers=num_layers,
             gnn_type=gnn_type,
             dropout=dropout,
-            pooling=pooling
+            pooling=pooling,
+            num_rois=num_rois  # 🔥 传递参数
         )
     else:
         raise ValueError(f"Unknown model_type: {model_type}")
 
     return model
-
-
-# if __name__ == '__main__':
-#     # 测试代码
-#     from torch_geometric.data import Batch
-#
-#     # 创建假数据
-#     data1 = Data(
-#         x=torch.randn(116, 11),  # 116个ROI，11维统计特征
-#         edge_index=torch.randint(0, 116, (2, 500)),
-#         edge_attr=torch.randn(500, 1),
-#         y=torch.LongTensor([0])
-#     )
-#
-#     data2 = Data(
-#         x=torch.randn(116, 11),
-#         edge_index=torch.randint(0, 116, (2, 500)),
-#         edge_attr=torch.randn(500, 1),
-#         y=torch.LongTensor([1])
-#     )
-#
-#     batch = Batch.from_data_list([data1, data2])
-#
-#     # 测试不同模型
-#     print("Testing models...")
-#
-#     for model_type in ['linear', 'mlp', 'gnn']:
-#         print(f"\n{model_type.upper()}:")
-#         model = create_model(
-#             model_type=model_type,
-#             input_dim=11,
-#             hidden_dim=64,
-#             output_dim=2
-#         )
-#
-#         output = model(batch)
-#         print(f"  Output shape: {output.shape}")
-#         print(f"  Parameters: {sum(p.numel() for p in model.parameters())}")

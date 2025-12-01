@@ -1,301 +1,337 @@
 """
-SF-DPL模型 - 改进版
-核心改进：
-1. 大幅降低辅助损失权重
-2. 差异化初始化两个编码器
-3. 添加特征标准化
-4. 渐进式训练策略
+SF-DPL Model: Structure-Functional Decoupling with Prompt Learning
+解决GNN在脑网络分析中的位置丢失问题
 """
-import numpy as np
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch_geometric.nn import global_mean_pool
-from model import GIN
+from torch_geometric.nn import GCNConv, GATConv, global_mean_pool, global_max_pool
 
 
-class StructurePrompt(nn.Module):
-    """结构提示模块 - 简化版"""
+class SF_DPL_Model(nn.Module):
+    """
+    带有 Node Prompt 的 GNN 模型
 
-    def __init__(self, hidden_dim, num_prompts=5):
-        super().__init__()
-        self.hidden_dim = hidden_dim
-        self.num_prompts = num_prompts
+    核心创新：
+    1. Node Prompt: 给每个ROI一个可学习的位置编码
+    2. Enhanced Pooling: Mean + Max 结合
+    3. 更强的正则化
+    """
 
-        # 结构提示向量
-        self.prompts = nn.Parameter(torch.randn(num_prompts, hidden_dim) * 0.01)
-
-        # 简化的注意力机制
-        self.attention = nn.Sequential(
-            nn.Linear(hidden_dim, num_prompts),
-            nn.Softmax(dim=-1)
-        )
-
-    def forward(self, x):
-        # 计算注意力权重
-        weights = self.attention(x)  # [B, num_prompts]
-
-        # 加权提示
-        prompted = torch.matmul(weights, self.prompts)  # [B, hidden_dim]
-
-        return x + prompted * 0.1  # 降低提示强度
-
-
-class FunctionPrompt(nn.Module):
-    """功能提示模块 - 简化版"""
-
-    def __init__(self, hidden_dim, num_prompts=5):
-        super().__init__()
-        self.hidden_dim = hidden_dim
-        self.num_prompts = num_prompts
-
-        self.prompts = nn.Parameter(torch.randn(num_prompts, hidden_dim) * 0.01)
-
-        # 门控机制
-        self.gate = nn.Sequential(
-            nn.Linear(hidden_dim, 1),
-            nn.Sigmoid()
-        )
-
-    def forward(self, x):
-        # 静态提示
-        static_prompt = self.prompts.mean(dim=0).unsqueeze(0).expand_as(x)
-
-        # 门控权重
-        gate_weight = self.gate(x)
-
-        return x + static_prompt * gate_weight * 0.1
-
-
-class SF_DPL(nn.Module):
-    """SF-DPL主模型 - 大幅改进版"""
-
-    def __init__(self,
-                 num_layer=5,
-                 struct_input_dim=None,
-                 func_input_dim=None,
-                 hidden_dim=128,
-                 num_classes=2,
-                 drop_ratio=0.3,
-                 num_prompts=5,
-                 ortho_weight=0.01,    # ⭐ 大幅降低（从1.0降到0.01）
-                 decorr_weight=0.005):  # ⭐ 大幅降低（从0.5降到0.005）
+    def __init__(self, input_dim, hidden_dim=64, output_dim=2,
+                 num_layers=2, dropout=0.5,
+                 use_node_prompt=True, use_edge_prompt=False,
+                 num_rois=116, gnn_type='gcn'):
+        """
+        Args:
+            input_dim: 节点特征维度
+            hidden_dim: 隐藏层维度
+            output_dim: 输出类别数
+            num_layers: GNN层数
+            dropout: dropout比率
+            use_node_prompt: 是否使用节点提示
+            use_edge_prompt: 是否使用边提示（暂未实现）
+            num_rois: ROI数量
+            gnn_type: GNN类型 ('gcn' or 'gat')
+        """
         super().__init__()
 
-        self.num_layer = num_layer
-        self.hidden_dim = hidden_dim
-        self.num_classes = num_classes
-        self.ortho_weight = ortho_weight
-        self.decorr_weight = decorr_weight
-        self.drop_ratio = drop_ratio
+        self.use_node_prompt = use_node_prompt
+        self.use_edge_prompt = use_edge_prompt
+        self.num_rois = num_rois
+        self.num_layers = num_layers
+        self.gnn_type = gnn_type
+        self.dropout = dropout
 
-        # 动态确定输入维度
-        self.struct_input_dim = struct_input_dim
-        self.func_input_dim = func_input_dim
+        print(f"\n{'='*60}")
+        print(f"初始化 SF-DPL 模型")
+        print(f"{'='*60}")
+        print(f"  Node Prompt: {use_node_prompt}")
+        print(f"  GNN类型: {gnn_type}")
+        print(f"  ROI数量: {num_rois}")
+        print(f"  隐藏维度: {hidden_dim}")
+        print(f"{'='*60}\n")
 
-        # 编码器稍后创建
-        self.struct_encoder = None
-        self.func_encoder = None
+        # ===== 1. Node Prompt =====
+        # 核心创新：给每个ROI一个独特的可学习向量
+        # 形状: [1, num_rois, input_dim]
+        if use_node_prompt:
+            self.node_prompt = nn.Parameter(
+                torch.randn(1, num_rois, input_dim) * 0.02
+            )
+            print(f"  ✓ Node Prompt 参数: {self.node_prompt.numel():,}")
 
-        # 提示模块
-        self.struct_prompt = StructurePrompt(hidden_dim, num_prompts)
-        self.func_prompt = FunctionPrompt(hidden_dim, num_prompts)
+        # ===== 2. GNN Layers =====
+        self.convs = nn.ModuleList()
+        self.batch_norms = nn.ModuleList()
 
-        # ⭐ 添加BatchNorm稳定训练
-        self.bn1 = nn.BatchNorm1d(hidden_dim)
-        self.bn2 = nn.BatchNorm1d(hidden_dim)
+        for i in range(num_layers):
+            in_dim = input_dim if i == 0 else hidden_dim
+            out_dim = hidden_dim
 
-        # 融合层
-        self.fusion = nn.Sequential(
-            nn.Linear(hidden_dim * 2, hidden_dim),
-            nn.BatchNorm1d(hidden_dim),  # ⭐ 添加BN
-            nn.ReLU(),
-            nn.Dropout(drop_ratio),
-            nn.Linear(hidden_dim, hidden_dim)
-        )
+            if gnn_type == 'gcn':
+                self.convs.append(GCNConv(in_dim, out_dim))
+            elif gnn_type == 'gat':
+                # GAT with 4 heads
+                self.convs.append(
+                    GATConv(in_dim, out_dim // 4, heads=4, concat=True)
+                )
+            else:
+                raise ValueError(f"Unknown gnn_type: {gnn_type}")
 
-        # 分类器
+            self.batch_norms.append(nn.BatchNorm1d(out_dim))
+
+        # ===== 3. Readout & Classifier =====
+        # 使用 Mean + Max pooling
+        classifier_input_dim = hidden_dim * 2
+
         self.classifier = nn.Sequential(
+            nn.Linear(classifier_input_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(dropout),
             nn.Linear(hidden_dim, hidden_dim // 2),
             nn.ReLU(),
-            nn.Dropout(drop_ratio),
-            nn.Linear(hidden_dim // 2, num_classes)
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim // 2, output_dim)
         )
 
-    def _create_encoder(self, input_dim):
-        """动态创建编码器"""
-        return GIN(
-            num_layer=self.num_layer,
-            input_dim=input_dim,
-            hidden_dim=self.hidden_dim,
-            drop_ratio=self.drop_ratio
-        )
+        total_params = sum(p.numel() for p in self.parameters())
+        print(f"  ✓ 总参数量: {total_params:,}\n")
 
-    def forward(self, struct_data, func_data):
-        # 首次调用时创建编码器
-        if self.struct_encoder is None:
-            self.struct_input_dim = struct_data.x.shape[1]
-            self.struct_encoder = self._create_encoder(self.struct_input_dim).to(struct_data.x.device)
+    def apply_node_prompt(self, x, batch):
+        """
+        应用 Node Prompt
 
-        if self.func_encoder is None:
-            self.func_input_dim = func_data.x.shape[1]
-            self.func_encoder = self._create_encoder(self.func_input_dim).to(func_data.x.device)
+        Args:
+            x: [num_total_nodes, feature_dim]
+            batch: [num_total_nodes]
 
-        # 结构流编码
-        struct_feat = self.struct_encoder(struct_data, pooling='mean')
-        struct_feat = self.bn1(struct_feat)  # ⭐ 标准化
-        struct_feat = self.struct_prompt(struct_feat)
+        Returns:
+            x: [num_total_nodes, feature_dim] (加上了prompt)
+        """
+        if not self.use_node_prompt:
+            return x
 
-        # 功能流编码
-        func_feat = self.func_encoder(func_data, pooling='mean')
-        func_feat = self.bn2(func_feat)  # ⭐ 标准化
-        func_feat = self.func_prompt(func_feat)
+        try:
+            batch_size = batch.max().item() + 1
 
-        # ⭐ 计算辅助损失（大幅降低权重）
-        ortho_loss = self.compute_orthogonality_loss(struct_feat, func_feat)
-        decorr_loss = self.compute_decorrelation_loss(struct_feat, func_feat)
+            # 将 x 重塑为 [batch_size, num_rois, feature_dim]
+            x_reshaped = x.view(batch_size, self.num_rois, -1)
 
-        total_aux_loss = ortho_loss + decorr_loss
+            # 广播加法: [B, N, D] + [1, N, D]
+            x_reshaped = x_reshaped + self.node_prompt
 
-        # 特征融合
-        combined = torch.cat([struct_feat, func_feat], dim=-1)
-        fused = self.fusion(combined)
+            # 变回 PyG 格式: [B*N, D]
+            x = x_reshaped.view(-1, x.shape[1])
 
-        # 分类
-        logits = self.classifier(fused)
+            return x
 
-        return logits, total_aux_loss
+        except Exception as e:
+            # 如果形状不匹配，跳过 prompt
+            print(f"  ⚠️  Node Prompt 应用失败: {e}")
+            return x
 
-    def compute_orthogonality_loss(self, feat1, feat2):
-        """正交化损失 - 添加安全检查"""
-        if torch.isnan(feat1).any() or torch.isnan(feat2).any():
-            return torch.tensor(0.0, device=feat1.device)
+    def forward(self, data):
+        """
+        前向传播
 
-        # ⭐ 使用更稳定的归一化
-        eps = 1e-8
-        feat1_norm = F.normalize(feat1, p=2, dim=1, eps=eps)
-        feat2_norm = F.normalize(feat2, p=2, dim=1, eps=eps)
+        Args:
+            data: PyG Data对象
 
-        # 余弦相似度
-        similarity = torch.sum(feat1_norm * feat2_norm, dim=1)
+        Returns:
+            logits: [batch_size, output_dim]
+        """
+        x, edge_index, batch = data.x, data.edge_index, data.batch
 
-        if torch.isnan(similarity).any():
-            return torch.tensor(0.0, device=feat1.device)
+        # 获取边权重
+        if hasattr(data, 'edge_attr') and data.edge_attr is not None:
+            edge_weight = data.edge_attr.squeeze()
 
-        # ⭐ 使用平方而不是绝对值（更温和）
-        ortho_loss = torch.mean(similarity ** 2)
+            # 清理无效值
+            if torch.isnan(edge_weight).any() or torch.isinf(edge_weight).any():
+                edge_weight = torch.nan_to_num(
+                    edge_weight, nan=0.0, posinf=0.0, neginf=0.0
+                )
+        else:
+            edge_weight = None
 
-        if torch.isnan(ortho_loss):
-            return torch.tensor(0.0, device=feat1.device)
+        # ===== Step 1: Apply Node Prompt =====
+        x = self.apply_node_prompt(x, batch)
 
-        return ortho_loss * self.ortho_weight
-
-    def compute_decorrelation_loss(self, feat1, feat2):
-        """解耦损失 - 添加安全检查"""
-        if torch.isnan(feat1).any() or torch.isnan(feat2).any():
-            return torch.tensor(0.0, device=feat1.device)
-
-        # 中心化
-        feat1_centered = feat1 - feat1.mean(dim=0, keepdim=True)
-        feat2_centered = feat2 - feat2.mean(dim=0, keepdim=True)
-
-        # 协方差矩阵
-        batch_size = feat1.size(0)
-        cov_matrix = torch.matmul(feat1_centered.t(), feat2_centered) / (batch_size - 1)
-
-        # Frobenius范数
-        decorr_loss = torch.norm(cov_matrix, p='fro') ** 2
-
-        if torch.isnan(decorr_loss):
-            return torch.tensor(0.0, device=feat1.device)
-
-        return decorr_loss * self.decorr_weight
-
-    def load_pretrained_weights(self, struct_path=None, func_path=None):
-        """加载预训练权重 - 添加差异化扰动"""
-
-        def load_with_perturbation(encoder, path, perturb_std=0.02):
-            """加载权重并添加扰动"""
-            print(f"加载预训练权重: {path}")
-            checkpoint = torch.load(path, map_location='cpu')
-
-            if 'gnn' in checkpoint:
-                state_dict = checkpoint['gnn']
-            elif 'model_state_dict' in checkpoint:
-                state_dict = checkpoint['model_state_dict']
+        # ===== Step 2: GNN Propagation =====
+        for i in range(self.num_layers):
+            if self.gnn_type == 'gat':
+                # GAT 不支持 edge_weight
+                x = self.convs[i](x, edge_index)
             else:
-                state_dict = checkpoint
+                # GCN 支持 edge_weight
+                x = self.convs[i](x, edge_index, edge_weight=edge_weight)
 
-            # ⭐ 为每个编码器添加不同的随机扰动
-            perturbed_state = {}
-            for k, v in state_dict.items():
-                # 跳过第一层（保持预训练特征）
-                if 'convs.0' in k:
-                    perturbed_state[k] = v
-                else:
-                    # 添加高斯噪声
-                    noise = torch.randn_like(v) * perturb_std * v.std()
-                    perturbed_state[k] = v + noise
+            x = self.batch_norms[i](x)
+            x = F.relu(x)
+            x = F.dropout(x, p=self.dropout, training=self.training)
 
-            encoder.load_state_dict(perturbed_state, strict=False)
-            print("✓ 权重加载完成（已添加扰动）")
+        # ===== Step 3: Graph Pooling =====
+        x_mean = global_mean_pool(x, batch)
+        x_max = global_max_pool(x, batch)
 
-        if struct_path and self.struct_encoder:
-            load_with_perturbation(self.struct_encoder, struct_path, perturb_std=0.02)
+        # 拼接
+        x = torch.cat([x_mean, x_max], dim=1)
 
-        if func_path and self.func_encoder:
-            load_with_perturbation(self.func_encoder, func_path, perturb_std=0.03)  # 功能流扰动更大
+        # ===== Step 4: Classification =====
+        logits = self.classifier(x)
+
+        return logits
 
 
-# ⭐ 训练辅助函数
-def train_sf_dpl_one_epoch(model, train_loader, optimizer, device):
-    """训练一个epoch - 改进版"""
-    model.train()
-    total_loss = 0
-    total_ce_loss = 0
-    total_aux_loss = 0
-    num_batches = 0
+class LinearProbe(nn.Module):
+    """线性探针（用于对比）"""
 
-    for batch_idx, batch in enumerate(train_loader):
-        func_data, struct_data = batch
-        func_data = func_data.to(device)
-        struct_data = struct_data.to(device)
+    def __init__(self, input_dim, output_dim=2, pooling='mean_max', num_rois=116):
+        super().__init__()
 
-        # 检查输入
-        if torch.isnan(func_data.x).any() or torch.isnan(struct_data.x).any():
-            print(f"警告: Batch {batch_idx} 输入含有NaN")
-            continue
+        self.pooling = pooling
 
-        optimizer.zero_grad()
-        logits, aux_loss = model(struct_data, func_data)
+        classifier_input_dim = input_dim
+        if pooling == 'mean_max':
+            classifier_input_dim = input_dim * 2
 
-        if torch.isnan(logits).any():
-            print(f"警告: Batch {batch_idx} 输出含有NaN")
-            continue
+        self.classifier = nn.Linear(classifier_input_dim, output_dim)
 
-        # ⭐ 主任务损失占主导
-        ce_loss = F.cross_entropy(logits, func_data.y)
-        loss = ce_loss + aux_loss  # 由于aux_loss权重已大幅降低，这里直接相加
+    def forward(self, data):
+        x, batch = data.x, data.batch
 
-        if torch.isnan(loss):
-            print(f"警告: Batch {batch_idx} 总损失为NaN")
-            continue
+        if self.pooling == 'mean':
+            x = global_mean_pool(x, batch)
+        elif self.pooling == 'max':
+            x = global_max_pool(x, batch)
+        elif self.pooling == 'mean_max':
+            x_mean = global_mean_pool(x, batch)
+            x_max = global_max_pool(x, batch)
+            x = torch.cat([x_mean, x_max], dim=1)
 
-        loss.backward()
+        return self.classifier(x)
 
-        # ⭐ 梯度裁剪
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
 
-        optimizer.step()
+class MLPProbe(nn.Module):
+    """MLP探针（用于对比）"""
 
-        total_loss += loss.item()
-        total_ce_loss += ce_loss.item()
-        total_aux_loss += aux_loss.item()
-        num_batches += 1
+    def __init__(self, input_dim, hidden_dim=128, output_dim=2,
+                 dropout=0.5, pooling='mean_max', num_rois=116):
+        super().__init__()
 
-    if num_batches == 0:
-        return 0, 0, 0
+        self.pooling = pooling
 
-    return (total_loss / num_batches,
-            total_ce_loss / num_batches,
-            total_aux_loss / num_batches)
+        classifier_input_dim = input_dim
+        if pooling == 'mean_max':
+            classifier_input_dim = input_dim * 2
+
+        self.classifier = nn.Sequential(
+            nn.Linear(classifier_input_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim // 2, output_dim)
+        )
+
+    def forward(self, data):
+        x, batch = data.x, data.batch
+
+        if self.pooling == 'mean':
+            x = global_mean_pool(x, batch)
+        elif self.pooling == 'max':
+            x = global_max_pool(x, batch)
+        elif self.pooling == 'mean_max':
+            x_mean = global_mean_pool(x, batch)
+            x_max = global_max_pool(x, batch)
+            x = torch.cat([x_mean, x_max], dim=1)
+
+        return self.classifier(x)
+
+
+def create_model(model_type, input_dim, hidden_dim=64, output_dim=2,
+                 num_layers=2, gnn_type='gcn', dropout=0.5,
+                 pooling='mean_max', num_rois=116,
+                 use_node_prompt=True, use_edge_prompt=False):
+    """
+    模型工厂函数
+
+    Args:
+        model_type: 'sf_dpl', 'linear', 'mlp'
+        其他参数同上
+
+    Returns:
+        model: PyTorch模型
+    """
+    if model_type == 'sf_dpl':
+        model = SF_DPL_Model(
+            input_dim=input_dim,
+            hidden_dim=hidden_dim,
+            output_dim=output_dim,
+            num_layers=num_layers,
+            dropout=dropout,
+            use_node_prompt=use_node_prompt,
+            use_edge_prompt=use_edge_prompt,
+            num_rois=num_rois,
+            gnn_type=gnn_type
+        )
+    elif model_type == 'linear':
+        model = LinearProbe(
+            input_dim=input_dim,
+            output_dim=output_dim,
+            pooling=pooling,
+            num_rois=num_rois
+        )
+    elif model_type == 'mlp':
+        model = MLPProbe(
+            input_dim=input_dim,
+            hidden_dim=hidden_dim,
+            output_dim=output_dim,
+            dropout=dropout,
+            pooling=pooling,
+            num_rois=num_rois
+        )
+    else:
+        raise ValueError(f"Unknown model_type: {model_type}")
+
+    return model
+
+
+if __name__ == '__main__':
+    # 测试代码
+    from torch_geometric.data import Data, Batch
+
+    print("Testing SF-DPL Model...")
+
+    # 创建假数据
+    data1 = Data(
+        x=torch.randn(116, 64),  # 116个ROI，64维特征
+        edge_index=torch.randint(0, 116, (2, 500)),
+        edge_attr=torch.randn(500, 1),
+        y=torch.LongTensor([0])
+    )
+
+    data2 = Data(
+        x=torch.randn(116, 64),
+        edge_index=torch.randint(0, 116, (2, 500)),
+        edge_attr=torch.randn(500, 1),
+        y=torch.LongTensor([1])
+    )
+
+    batch = Batch.from_data_list([data1, data2])
+
+    # 测试模型
+    model = create_model(
+        model_type='sf_dpl',
+        input_dim=64,
+        hidden_dim=64,
+        num_rois=116,
+        use_node_prompt=True
+    )
+
+    output = model(batch)
+    print(f"\n✓ 输出形状: {output.shape}")
+    print(f"✓ 参数量: {sum(p.numel() for p in model.parameters()):,}")

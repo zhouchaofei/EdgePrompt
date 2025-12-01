@@ -1,10 +1,64 @@
 """
 使用预训练的Node Encoder提取节点特征
+修改：增加滑窗+平均池化策略
 """
 
 import torch
 import numpy as np
-from node_pretrain import NodeEncoder
+from node_pretrain import MAE_Encoder
+
+
+def sliding_window_inference(timeseries, encoder, window_size, stride, device):
+    """
+    滑窗推理+平均池化
+
+    Args:
+        timeseries: (T,) 单个ROI的时间序列
+        encoder: 预训练的encoder
+        window_size: 窗口大小
+        stride: 滑动步长
+        device: 设备
+
+    Returns:
+        embedding: (embedding_dim,) ROI的特征向量
+    """
+    T = len(timeseries)
+
+    if T < window_size:
+        # 如果序列太短，padding到window_size
+        padded = np.zeros(window_size)
+        padded[:T] = timeseries
+        timeseries = padded
+        T = window_size
+
+    # 滑窗切片
+    num_windows = (T - window_size) // stride + 1
+    embeddings = []
+
+    for i in range(num_windows):
+        start = i * stride
+        end = start + window_size
+        chunk = timeseries[start:end]
+
+        # Z-score标准化（与预训练保持一致）
+        mean = np.mean(chunk)
+        std = np.std(chunk) + 1e-6
+        chunk_norm = (chunk - mean) / std
+
+        # 转tensor
+        chunk_tensor = torch.FloatTensor(chunk_norm).unsqueeze(0).to(device)  # [1, window_size]
+
+        # 编码
+        with torch.no_grad():
+            embedding = encoder(chunk_tensor)  # [1, embedding_dim]
+
+        embeddings.append(embedding.cpu().numpy())
+
+    # 平均池化
+    embeddings = np.vstack(embeddings)  # [num_windows, embedding_dim]
+    avg_embedding = np.mean(embeddings, axis=0)  # [embedding_dim]
+
+    return avg_embedding
 
 
 def extract_node_features_pretrained(timeseries_list, encoder_path,
@@ -22,75 +76,78 @@ def extract_node_features_pretrained(timeseries_list, encoder_path,
         features_list: 特征列表 [N_subjects, (N_ROI, embedding_dim)]
     """
     print(f"\n{'=' * 80}")
-    print("Extracting Node Features with Pretrained Encoder")
+    print("使用预训练Encoder提取节点特征")
     print(f"{'=' * 80}")
-    print(f"Encoder: {encoder_path}")
+    print(f"Encoder路径: {encoder_path}")
 
-    # 加载预训练encoder
-    # checkpoint = torch.load(encoder_path, map_location=device)
-    # config = checkpoint['config']
-    #
-    # input_length = config['input_length']
-    checkpoint = torch.load(encoder_path)
+    # 加载预训练checkpoint
+    checkpoint = torch.load(encoder_path, map_location=device)
     config = checkpoint['config']
 
-    input_length = config['input_length']  # ✅ 使用保存的长度
+    window_size = config['input_length']
+    stride = window_size // 2  # 50%重叠
 
-    # ✅ 检查长度兼容性
-    actual_min_length = min(ts.shape[0] for ts in timeseries_list)
-    if actual_min_length < input_length:
-        print(f"⚠️  Warning: Data length {actual_min_length} < "
-              f"pretrained length {input_length}")
-        print(f"   Using shorter length: {actual_min_length}")
-        input_length = actual_min_length
+    print(f"  ✓ 加载checkpoint (epoch {checkpoint['epoch']})")
+    print(f"  窗口大小: {window_size}")
+    print(f"  Embedding维度: {embedding_dim}")
+    print(f"  滑动步长: {stride}")
 
-    encoder = NodeEncoder(
-        input_length=input_length,
+    # 创建encoder并加载权重
+    encoder = MAE_Encoder(
+        input_length=window_size,
         embedding_dim=embedding_dim
     ).to(device)
 
-    # 加载权重（只加载encoder部分）
-    state_dict = checkpoint['model_state_dict']
-    encoder_state_dict = {
-        k.replace('encoder.', ''): v
-        for k, v in state_dict.items()
-        if k.startswith('encoder.')
-    }
-    encoder.load_state_dict(encoder_state_dict)
-    encoder.eval()
+    # 只加载encoder部分
+    encoder_state_dict = {}
+    for k, v in checkpoint['model_state_dict'].items():
+        if k.startswith('encoder.'):
+            encoder_state_dict[k.replace('encoder.', '')] = v
 
-    print(f"✓ Encoder loaded from epoch {checkpoint['epoch']}")
-    print(f"  Input length: {input_length}")
-    print(f"  Embedding dim: {embedding_dim}")
+    encoder.load_state_dict(encoder_state_dict)
+    # encoder.train()
+    # print("⚠️ 注意: 已强制模型进入 .train() 模式以避开 Batch Norm 统计量偏移问题")
+
+    print(f"  ✓ Encoder加载完成")
 
     # 提取特征
     features_list = []
 
-    with torch.no_grad():
-        for i, ts in enumerate(timeseries_list):
-            # 截断到相同长度
-            ts = ts[:input_length, :]
-            n_roi = ts.shape[1]
+    for i, ts in enumerate(timeseries_list):
+        if ts.shape[0] == 116 and ts.shape[1] != 116:
+            # 假设 Time > 116，或者单纯就是反了
+            ts = ts.T
 
-            roi_features = []
+        if ts.shape[1] != 116:
+            print(f"❌ 严重警告: 样本 {i} 的形状不对! Shape={ts.shape}. 期望第二个维度是116(ROIs)")
+        # ts shape: (T, N_ROI)
+        T, n_roi = ts.shape
 
-            for roi_idx in range(n_roi):
-                roi_signal = ts[:, roi_idx]
-                roi_tensor = torch.FloatTensor(roi_signal).unsqueeze(0).to(device)
+        roi_features = []
 
-                # 提取embedding
-                embedding = encoder(roi_tensor)
-                roi_features.append(embedding.cpu().numpy())
+        for roi_idx in range(n_roi):
+            roi_signal = ts[:, roi_idx]  # (T,)
 
-            features = np.vstack(roi_features)  # [N_ROI, embedding_dim]
-            features_list.append(features)
+            # 滑窗推理+平均池化
+            embedding = sliding_window_inference(
+                timeseries=roi_signal,
+                encoder=encoder,
+                window_size=window_size,
+                stride=stride,
+                device=device
+            )
 
-            if (i + 1) % 50 == 0:
-                print(f"  Processed: {i + 1}/{len(timeseries_list)}")
+            roi_features.append(embedding)
 
-    print(f"\n✓ Feature extraction completed")
-    print(f"  Number of subjects: {len(features_list)}")
-    print(f"  Feature shape per subject: {features_list[0].shape}")
+        features = np.vstack(roi_features)  # [N_ROI, embedding_dim]
+        features_list.append(features)
+
+        if (i + 1) % 50 == 0:
+            print(f"  处理进度: {i + 1}/{len(timeseries_list)}")
+
+    print(f"\n✓ 特征提取完成")
+    print(f"  被试数: {len(features_list)}")
+    print(f"  特征形状: {features_list[0].shape}")
 
     return features_list
 
@@ -104,9 +161,9 @@ if __name__ == '__main__':
 
     features = extract_node_features_pretrained(
         timeseries_list,
-        encoder_path='./pretrained_models/ABIDE_node_encoder.pth',
+        encoder_path='./pretrained_models/node_encoder_best.pth',
         embedding_dim=64,
         device='cuda'
     )
 
-    print(f"\nExtracted features shape: {features[0].shape}")
+    print(f"\n提取的特征形状: {features[0].shape}")

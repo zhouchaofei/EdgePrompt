@@ -166,7 +166,7 @@ def run_single_fold(graph_list, labels, train_idx, test_idx,
         num_layers=model_config.get('num_layers', 2),
         gnn_type=model_config.get('gnn_type', 'gcn'),
         dropout=model_config.get('dropout', 0.5),
-        pooling=model_config.get('pooling', 'mean')
+        pooling=model_config.get('pooling', 'flatten')
     ).to(device)
 
     # 优化器
@@ -271,15 +271,16 @@ def run_experiment(data_folder='./data/gnn_datasets',
 
     # 实验配置
     fc_methods = ['pearson', 'ledoit_wolf']
-    feature_types = ['statistical', 'temporal']
+    # feature_types = ['statistical', 'temporal']
+    feature_types = [ 'temporal']
 
     model_configs = [
-        {'name': 'Linear', 'model_type': 'linear', 'pooling': 'mean'},
-        {'name': 'MLP', 'model_type': 'mlp', 'hidden_dim': 128, 'pooling': 'mean'},
+        {'name': 'Linear', 'model_type': 'linear', 'pooling': 'flatten'},
+        # {'name': 'MLP', 'model_type': 'mlp', 'hidden_dim': 128, 'pooling': 'flatten'},
         {'name': 'GCN', 'model_type': 'gnn', 'gnn_type': 'gcn', 'hidden_dim': 64,
-         'num_layers': 2, 'pooling': 'mean'},
-        {'name': 'GAT', 'model_type': 'gnn', 'gnn_type': 'gat', 'hidden_dim': 64,
-         'num_layers': 2, 'pooling': 'mean'},
+         'num_layers': 2, 'pooling': 'flatten'},
+        # {'name': 'GAT', 'model_type': 'gnn', 'gnn_type': 'gat', 'hidden_dim': 64,
+        #  'num_layers': 2, 'pooling': 'flatten'},
     ]
 
     all_results = []
@@ -422,9 +423,9 @@ def main():
                         help='Number of CV repeats')
     parser.add_argument('--epochs', type=int, default=100,
                         help='Max training epochs')
-    parser.add_argument('--batch_size', type=int, default=32,
+    parser.add_argument('--batch_size', type=int, default=128,
                         help='Batch size')
-    parser.add_argument('--lr', type=float, default=0.001,
+    parser.add_argument('--lr', type=float, default=5e-4,
                         help='Learning rate')
 
     args = parser.parse_args()
