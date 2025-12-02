@@ -1,6 +1,9 @@
 """
-离线节点预训练 - Masked Autoencoder (MAE)
-严格按照MD文档要求实现
+离线节点预训练 - 增强版
+修改：
+1. 输入层添加BatchNorm
+2. 增加mask_ratio到0.6
+3. 优化训练策略
 """
 
 import torch
@@ -12,20 +15,10 @@ import os
 from datetime import datetime
 
 
-# ============================================================================
-# 数据准备：滑窗切片 + Z-score标准化
-# ============================================================================
-
 class TimeSeriesWindowDataset(Dataset):
     """滑窗时间序列数据集"""
 
     def __init__(self, timeseries_list, window_size=64, stride=32):
-        """
-        Args:
-            timeseries_list: List[np.array], 每个array形状为 (T, N_ROIs)
-            window_size: 窗口大小
-            stride: 滑动步长
-        """
         self.window_size = window_size
         self.stride = stride
         self.chunks = []
@@ -35,30 +28,26 @@ class TimeSeriesWindowDataset(Dataset):
         print(f"  滑动步长: {stride}")
 
         for ts_idx, ts in enumerate(timeseries_list):
-            # ts shape: (T, N_ROIs)
             T, N_rois = ts.shape
 
             if T < window_size:
-                print(f"  ⚠️  警告: 被试 {ts_idx} 长度 {T} < {window_size}, 跳过")
                 continue
 
-            # 滑窗切片
             num_windows = (T - window_size) // stride + 1
 
             for roi_idx in range(N_rois):
-                roi_signal = ts[:, roi_idx]  # (T,)
+                roi_signal = ts[:, roi_idx]
 
                 for w in range(num_windows):
                     start = w * stride
                     end = start + window_size
-                    chunk = roi_signal[start:end]  # (window_size,)
+                    chunk = roi_signal[start:end]
 
-                    # 🔥 关键：Z-score标准化
+                    # Z-score within window
                     mean = np.mean(chunk)
                     std = np.std(chunk) + 1e-6
                     chunk_norm = (chunk - mean) / std
 
-                    # 检查NaN
                     if np.any(np.isnan(chunk_norm)) or np.any(np.isinf(chunk_norm)):
                         continue
 
@@ -67,7 +56,7 @@ class TimeSeriesWindowDataset(Dataset):
             if (ts_idx + 1) % 50 == 0:
                 print(f"  处理进度: {ts_idx + 1}/{len(timeseries_list)}")
 
-        self.chunks = np.array(self.chunks, dtype=np.float32)  # (N_samples, window_size)
+        self.chunks = np.array(self.chunks, dtype=np.float32)
 
         print(f"\n✓ 数据准备完成")
         print(f"  总样本数: {len(self.chunks)}")
@@ -81,17 +70,16 @@ class TimeSeriesWindowDataset(Dataset):
         return torch.FloatTensor(self.chunks[idx])
 
 
-# ============================================================================
-# 模型架构：Encoder + Decoder
-# ============================================================================
-
 class MAE_Encoder(nn.Module):
-    """1D-CNN Encoder"""
+    """1D-CNN Encoder with Input Batch Normalization"""
 
     def __init__(self, input_length, embedding_dim=64, dropout=0.1):
         super().__init__()
 
         self.embedding_dim = embedding_dim
+
+        # 🔥 关键修改：输入层BatchNorm
+        self.input_bn = nn.BatchNorm1d(1)
 
         # 3层1D-CNN
         self.conv1 = nn.Conv1d(1, 32, kernel_size=7, padding=3)
@@ -105,10 +93,8 @@ class MAE_Encoder(nn.Module):
         self.conv3 = nn.Conv1d(64, 128, kernel_size=3, padding=1)
         self.bn3 = nn.BatchNorm1d(128)
 
-        # 全局平均池化
         self.global_pool = nn.AdaptiveAvgPool1d(1)
 
-        # 投影到embedding空间
         self.fc = nn.Sequential(
             nn.Linear(128, embedding_dim),
             nn.ReLU(),
@@ -119,14 +105,11 @@ class MAE_Encoder(nn.Module):
         self.dropout = nn.Dropout(dropout)
 
     def forward(self, x):
-        """
-        Args:
-            x: [B, L] or [B, 1, L]
-        Returns:
-            embedding: [B, embedding_dim]
-        """
         if x.dim() == 2:
             x = x.unsqueeze(1)  # [B, 1, L]
+
+        # 🔥 输入归一化
+        x = self.input_bn(x)
 
         # Encoder
         x = self.relu(self.bn1(self.conv1(x)))
@@ -141,7 +124,7 @@ class MAE_Encoder(nn.Module):
 
         # Global pooling
         x = self.global_pool(x)
-        x = x.squeeze(-1)  # [B, 128]
+        x = x.squeeze(-1)
 
         # Embedding
         embedding = self.fc(x)
@@ -157,7 +140,6 @@ class MAE_Decoder(nn.Module):
 
         self.output_length = output_length
 
-        # 上采样
         self.fc = nn.Sequential(
             nn.Linear(embedding_dim, 128),
             nn.ReLU(),
@@ -165,7 +147,6 @@ class MAE_Decoder(nn.Module):
             nn.Linear(128, 128 * (output_length // 4))
         )
 
-        # 3层反卷积
         self.deconv1 = nn.ConvTranspose1d(128, 64, kernel_size=4, stride=2, padding=1)
         self.bn1 = nn.BatchNorm1d(64)
 
@@ -177,12 +158,6 @@ class MAE_Decoder(nn.Module):
         self.relu = nn.ReLU()
 
     def forward(self, embedding):
-        """
-        Args:
-            embedding: [B, embedding_dim]
-        Returns:
-            reconstructed: [B, output_length]
-        """
         x = self.fc(embedding)
         x = x.view(x.size(0), 128, -1)
 
@@ -190,21 +165,16 @@ class MAE_Decoder(nn.Module):
         x = self.relu(self.bn2(self.deconv2(x)))
         x = self.deconv3(x)
 
-        # 确保输出长度正确
         if x.size(2) != self.output_length:
             x = F.interpolate(x, size=self.output_length, mode='linear', align_corners=False)
 
-        return x.squeeze(1)  # [B, output_length]
+        return x.squeeze(1)
 
-
-# ============================================================================
-# MAE预训练模型
-# ============================================================================
 
 class MaskedAutoencoder(nn.Module):
     """Masked Autoencoder"""
 
-    def __init__(self, input_length, embedding_dim=64, mask_ratio=0.3):
+    def __init__(self, input_length, embedding_dim=64, mask_ratio=0.6):  # 🔥 mask_ratio改为0.6
         super().__init__()
 
         self.input_length = input_length
@@ -214,89 +184,48 @@ class MaskedAutoencoder(nn.Module):
         self.decoder = MAE_Decoder(embedding_dim, input_length)
 
     def create_mask(self, x):
-        """
-        创建随机mask
-        Args:
-            x: [B, L]
-        Returns:
-            x_masked: [B, L] 被mask的输入
-            mask: [B, L] mask位置 (True=被mask)
-        """
         B, L = x.shape
-
-        # 随机生成mask（每个样本独立）
         mask = torch.rand(B, L, device=x.device) < self.mask_ratio
-
         x_masked = x.clone()
-        x_masked[mask] = 0  # 被mask的位置设为0
-
+        x_masked[mask] = 0
         return x_masked, mask
 
     def forward(self, x):
-        """
-        Args:
-            x: [B, L] 原始输入
-        Returns:
-            reconstructed: [B, L] 重建输出
-            mask: [B, L] mask位置
-        """
-        # 创建masked输入
         x_masked, mask = self.create_mask(x)
-
-        # 编码
         embedding = self.encoder(x_masked)
-
-        # 解码
         reconstructed = self.decoder(embedding)
-
         return reconstructed, mask
 
-
-# ============================================================================
-# 训练函数
-# ============================================================================
 
 def train_mae_offline(timeseries_list,
                       window_size=64,
                       embedding_dim=64,
-                      mask_ratio=0.3,
+                      mask_ratio=0.6,  # 🔥 默认0.6
                       epochs=50,
                       batch_size=128,
                       lr=1e-3,
                       device='cuda',
                       save_dir='./pretrained_models'):
-    """
-    离线MAE预训练
-
-    Args:
-        timeseries_list: 所有时间序列数据（不需要标签）
-        window_size: 窗口大小
-        embedding_dim: embedding维度
-        mask_ratio: mask比例
-        epochs: 训练轮数
-        batch_size: batch大小
-        lr: 学习率
-        device: 设备
-        save_dir: 保存目录
-    """
+    """离线MAE预训练（增强版）"""
 
     print("\n" + "="*80)
-    print("离线节点预训练 - Masked Autoencoder (MAE)")
+    print("离线节点预训练 - Masked Autoencoder (Enhanced)")
     print("="*80)
     print(f"窗口大小: {window_size}")
     print(f"Embedding维度: {embedding_dim}")
-    print(f"Mask比例: {mask_ratio}")
+    print(f"Mask比例: {mask_ratio} (增强版)")  # 🔥
+    print(f"Input BatchNorm: ✓ Enabled")  # 🔥
     print(f"Batch大小: {batch_size}")
     print(f"学习率: {lr}")
     print(f"训练轮数: {epochs}")
     print(f"设备: {device}")
     print("="*80)
 
-    # 1. 准备数据
+    # 准备数据
     dataset = TimeSeriesWindowDataset(
         timeseries_list,
         window_size=window_size,
-        stride=window_size // 2  # 50%重叠
+        stride=window_size // 2
     )
 
     dataloader = DataLoader(
@@ -307,7 +236,7 @@ def train_mae_offline(timeseries_list,
         pin_memory=True
     )
 
-    # 2. 创建模型
+    # 创建模型
     model = MaskedAutoencoder(
         input_length=window_size,
         embedding_dim=embedding_dim,
@@ -316,7 +245,7 @@ def train_mae_offline(timeseries_list,
 
     print(f"\n模型参数量: {sum(p.numel() for p in model.parameters()):,}")
 
-    # 3. 优化器（使用AdamW）
+    # 优化器
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=lr,
@@ -324,14 +253,14 @@ def train_mae_offline(timeseries_list,
         betas=(0.9, 0.95)
     )
 
-    # 4. 学习率调度器
+    # 学习率调度器
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer,
         T_max=epochs,
         eta_min=lr * 0.01
     )
 
-    # 5. 训练
+    # 训练
     best_loss = float('inf')
     model.train()
 
@@ -347,7 +276,7 @@ def train_mae_offline(timeseries_list,
             # Forward
             reconstructed, mask = model(batch_x)
 
-            # 🔥 关键：只计算被mask位置的重建损失
+            # 只计算被mask位置的重建损失
             loss = F.mse_loss(reconstructed[mask], batch_x[mask])
 
             # Backward
@@ -384,7 +313,6 @@ def train_mae_offline(timeseries_list,
             save_path = os.path.join(save_dir, 'node_encoder_best.pth')
             torch.save(checkpoint, save_path)
 
-        # 每5个epoch打印一次
         if (epoch + 1) % 2 == 0:
             print(f"Epoch {epoch+1}/{epochs}: Loss={avg_loss:.6f} "
                   f"(Best={best_loss:.6f}) LR={optimizer.param_groups[0]['lr']:.6f}")
@@ -393,7 +321,6 @@ def train_mae_offline(timeseries_list,
     print(f"  最佳损失: {best_loss:.6f}")
     print(f"  模型保存至: {save_path}")
 
-    # 6. 验证：重建波形可视化
     visualize_reconstruction(model, dataset, device, save_dir)
 
     return model, best_loss
@@ -407,28 +334,23 @@ def visualize_reconstruction(model, dataset, device, save_dir):
 
     model.eval()
 
-    # 随机选择5个样本
     indices = np.random.choice(len(dataset), 5, replace=False)
 
     fig, axes = plt.subplots(5, 1, figsize=(12, 10))
 
     with torch.no_grad():
         for i, idx in enumerate(indices):
-            x = dataset[idx].unsqueeze(0).to(device)  # [1, L]
+            x = dataset[idx].unsqueeze(0).to(device)
 
-            # 重建
             reconstructed, mask = model(x)
 
-            # 转回CPU
             x = x.cpu().numpy()[0]
             reconstructed = reconstructed.cpu().numpy()[0]
             mask = mask.cpu().numpy()[0]
 
-            # 绘图
             axes[i].plot(x, 'b-', label='Original', linewidth=1.5)
             axes[i].plot(reconstructed, 'r--', label='Reconstructed', linewidth=1.5, alpha=0.8)
 
-            # 标记mask位置
             mask_indices = np.where(mask)[0]
             axes[i].scatter(mask_indices, x[mask_indices], c='orange', s=10,
                            label='Masked points', zorder=5)
@@ -445,20 +367,16 @@ def visualize_reconstruction(model, dataset, device, save_dir):
     print(f"  ✓ 可视化保存至: {save_path}")
 
 
-# ============================================================================
-# 主函数
-# ============================================================================
-
 if __name__ == '__main__':
     import argparse
 
-    parser = argparse.ArgumentParser(description='离线节点预训练')
+    parser = argparse.ArgumentParser(description='离线节点预训练（增强版）')
     parser.add_argument('--dataset', type=str, required=True,
                         choices=['ABIDE', 'MDD', 'BOTH'])
     parser.add_argument('--data_folder', type=str, default='./data')
     parser.add_argument('--window_size', type=int, default=64)
     parser.add_argument('--embedding_dim', type=int, default=64)
-    parser.add_argument('--mask_ratio', type=float, default=0.3)
+    parser.add_argument('--mask_ratio', type=float, default=0.6)  # 🔥 默认0.6
     parser.add_argument('--epochs', type=int, default=100)
     parser.add_argument('--batch_size', type=int, default=128)
     parser.add_argument('--lr', type=float, default=1e-3)

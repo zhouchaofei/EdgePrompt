@@ -271,8 +271,9 @@ def run_experiment(data_folder='./data/gnn_datasets',
 
     # 实验配置
     fc_methods = ['pearson', 'ledoit_wolf']
-    # feature_types = ['statistical', 'temporal']
-    feature_types = [ 'temporal']
+    feature_types = ['statistical', 'temporal']
+    # feature_types = ['statistical']
+    # # feature_types = [ 'temporal']
 
     model_configs = [
         {'name': 'Linear', 'model_type': 'linear', 'pooling': 'flatten'},

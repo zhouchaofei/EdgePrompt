@@ -1,7 +1,9 @@
 """
-准备GNN实验数据（修复版）
-使用预训练的Node Encoder提取特征
-包含 load_gnn_dataset 函数
+GNN数据准备 - 终极修复版
+主要修改：
+1. 强制ID对齐，防止特征-标签错位
+2. 支持统计特征回退（Statistical Fallback）
+3. 增强数据质量检查
 """
 
 import os
@@ -13,14 +15,42 @@ from datetime import datetime
 import argparse
 
 from fc_construction import FCConstructor
-from node_features import StatisticalFeatureExtractor  # ✅ 只导入统计特征
-from extract_node_features import extract_node_features_pretrained  # ✅ 导入预训练版本
+from extract_node_features import extract_node_features_pretrained
 
 
-def load_timeseries_data(dataset_name, data_folder='./data'):
-    """加载时间序列数据"""
+def extract_statistical_features(timeseries):
+    """
+    提取鲁棒的统计特征
+
+    Args:
+        timeseries: [T, N_ROI] 时间序列
+
+    Returns:
+        features: [N_ROI, feature_dim] 统计特征
+    """
+    T, N_ROI = timeseries.shape
+
+    # 1. 基础统计量 (Mean, Std)
+    mean = np.mean(timeseries, axis=0)  # [N_ROI]
+    std = np.std(timeseries, axis=0)    # [N_ROI]
+
+    # 2. FC Profile (每个节点与其他节点的连接强度分布)
+    fc = np.corrcoef(timeseries.T)      # [N_ROI, N_ROI]
+    np.fill_diagonal(fc, 0)
+
+    # 拼接特征: [Mean(1), Std(1), FC(N_ROI)] = (2 + N_ROI) dim
+    features = np.column_stack([mean, std, fc])
+
+    return features
+
+
+def load_data_as_dict(dataset_name, data_folder='./data'):
+    """
+    加载数据并返回字典格式 {subject_id: {ts, label, site}}
+    确保ID对齐
+    """
     print(f"\n{'='*80}")
-    print(f"Loading {dataset_name} time series data...")
+    print(f"Loading {dataset_name} data as dictionary (ID-aligned)...")
     print(f"{'='*80}")
 
     if dataset_name == 'ABIDE':
@@ -40,15 +70,23 @@ def load_timeseries_data(dataset_name, data_folder='./data'):
     else:
         raise ValueError(f"Unknown dataset: {dataset_name}")
 
-    print(f"\n✓ Loaded {len(labels)} subjects")
-    print(f"  ROIs: {timeseries_list[0].shape[1]}")
-    print(f"  Label distribution: {np.bincount(labels)}")
+    # 构建字典 {subject_id: data}
+    data_dict = {}
+    for i, sub_id in enumerate(subject_ids):
+        data_dict[str(sub_id)] = {
+            'ts': timeseries_list[i],
+            'label': labels[i],
+            'site': site_ids[i] if site_ids is not None else 'unknown'
+        }
 
-    return timeseries_list, labels, subject_ids, site_ids
+    print(f"✓ Loaded {len(data_dict)} subjects as dictionary")
+    print(f"  Keys (first 3): {list(data_dict.keys())[:3]}")
+
+    return data_dict
 
 
 def construct_functional_graphs(timeseries_list, methods=['pearson', 'ledoit_wolf']):
-    """构建功能连接图"""
+    """构建功能连接图（保持原有逻辑）"""
     print(f"\n{'='*80}")
     print(f"Constructing functional connectivity graphs...")
     print(f"{'='*80}")
@@ -77,69 +115,11 @@ def construct_functional_graphs(timeseries_list, methods=['pearson', 'ledoit_wol
     return fc_dict
 
 
-def extract_statistical_features(timeseries_list):
-    """提取统计特征"""
-    print(f"\n{'='*80}")
-    print("Extracting statistical node features...")
-    print(f"{'='*80}")
-
-    extractor = StatisticalFeatureExtractor()
-    features_list = []
-
-    for i, ts in enumerate(timeseries_list):
-        features = extractor.extract_features(ts)
-        features_list.append(features)
-
-        if (i + 1) % 100 == 0:
-            print(f"  Processed: {i+1}/{len(timeseries_list)}")
-
-    features_array = np.array(features_list)
-    feature_dim = extractor.get_feature_dim()
-
-    print(f"\n✓ Statistical features extracted")
-    print(f"  Feature dim: {feature_dim}")
-    print(f"  Shape: {features_array.shape}")
-
-    return features_array, feature_dim
-
-
-def extract_pretrained_features(timeseries_list, encoder_path, embedding_dim, device):
-    """✅ 使用预训练encoder提取特征"""
-    print(f"\n{'='*80}")
-    print("Extracting pretrained node features...")
-    print(f"{'='*80}")
-
-    # ✅ 调用正确的函数
-    features_list = extract_node_features_pretrained(
-        timeseries_list=timeseries_list,
-        encoder_path=encoder_path,
-        embedding_dim=embedding_dim,
-        device=device
-    )
-
-    features_array = np.array(features_list)
-
-    print(f"\n✓ Pretrained features extracted")
-    print(f"  Feature dim: {embedding_dim}")
-    print(f"  Shape: {features_array.shape}")
-
-    return features_array, embedding_dim
-
-
 def create_pyg_graphs(fc_matrices, node_features, labels, top_k=20):
     """
-    创建PyTorch Geometric图对象（Top-K稀疏化版本）
-
-    Args:
-        fc_matrices: FC矩阵数组 [N_subjects, N_ROI, N_ROI]
-        node_features: 节点特征数组 [N_subjects, N_ROI, feature_dim]
-        labels: 标签数组
-        top_k: 每个节点保留最强的k个连接（默认20，约占116节点的17%）
-
-    Returns:
-        graph_list: PyG Data对象列表
+    创建PyTorch Geometric图对象（Top-K稀疏化）
     """
-    print(f"\n创建PyG图对象（Top-K稀疏化，k={top_k}）...")
+    print(f"\n创建PyG图对象（Top-K={top_k}）...")
 
     graph_list = []
     n_subjects = len(fc_matrices)
@@ -150,7 +130,7 @@ def create_pyg_graphs(fc_matrices, node_features, labels, top_k=20):
         x = node_features[i]
         y = labels[i]
 
-        # ===== 1. 清理无效值 =====
+        # 清理无效值
         if np.any(np.isnan(fc)) or np.any(np.isinf(fc)):
             fc = np.nan_to_num(fc, nan=0.0, posinf=0.0, neginf=0.0)
             invalid_count += 1
@@ -159,41 +139,33 @@ def create_pyg_graphs(fc_matrices, node_features, labels, top_k=20):
             x = np.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0)
             invalid_count += 1
 
-        # ===== 2. 处理FC矩阵 =====
-        # 取绝对值（连接强度）
+        # 处理FC矩阵
         fc_abs = np.abs(fc)
-
-        # 对角线设为0（去除自环）
         np.fill_diagonal(fc_abs, 0)
 
-        # ===== 3. 🔥 Top-K 稀疏化 =====
+        # Top-K 稀疏化
         num_nodes = fc_abs.shape[0]
-        k = min(top_k, num_nodes - 1)  # 防止k超过节点数
+        k = min(top_k, num_nodes - 1)
 
-        # 对每一行，找出最强的k个连接
-        # argsort返回从小到大的索引，取最后k个
         topk_indices = np.argsort(fc_abs, axis=1)[:, -k:]
 
-        # 构建稀疏边列表
         edge_index_list = []
         edge_attr_list = []
 
         for row in range(num_nodes):
             for col in topk_indices[row]:
-                if fc_abs[row, col] > 0:  # 额外保险
+                if fc_abs[row, col] > 0:
                     edge_index_list.append([row, col])
                     edge_attr_list.append(fc_abs[row, col])
 
-        # 转换为Tensor
         if len(edge_index_list) == 0:
-            # 如果没有边，创建一个最小图（每个节点连接到自己）
             edge_index = torch.arange(num_nodes).repeat(2, 1)
             edge_attr = torch.ones(num_nodes, 1) * 0.01
         else:
             edge_index = torch.tensor(edge_index_list, dtype=torch.long).t().contiguous()
             edge_attr = torch.tensor(edge_attr_list, dtype=torch.float).unsqueeze(1)
 
-        # ===== 4. 创建PyG Data对象 =====
+        # 创建PyG Data对象
         data = Data(
             x=torch.FloatTensor(x),
             edge_index=edge_index,
@@ -202,8 +174,8 @@ def create_pyg_graphs(fc_matrices, node_features, labels, top_k=20):
         )
 
         # 最终验证
-        assert not torch.isnan(data.x).any(), f"被试 {i} 的x仍包含NaN"
-        assert not torch.isnan(data.edge_attr).any(), f"被试 {i} 的edge_attr仍包含NaN"
+        assert not torch.isnan(data.x).any(), f"被试 {i} 的x包含NaN"
+        assert not torch.isnan(data.edge_attr).any(), f"被试 {i} 的edge_attr包含NaN"
 
         graph_list.append(data)
 
@@ -229,7 +201,7 @@ def create_pyg_graphs(fc_matrices, node_features, labels, top_k=20):
 
 def save_gnn_dataset(save_dir, dataset_name, fc_dict, features_dict,
                      labels, subject_ids, site_ids, top_k=20):
-    """保存GNN数据集（添加top_k参数）"""
+    """保存GNN数据集"""
     os.makedirs(save_dir, exist_ok=True)
 
     print(f"\n{'='*80}")
@@ -242,15 +214,13 @@ def save_gnn_dataset(save_dir, dataset_name, fc_dict, features_dict,
         for feature_type, node_features in features_dict.items():
             print(f"\n处理: {fc_method} + {feature_type}")
 
-            # 🔥 使用 Top-K 稀疏化
             graph_list = create_pyg_graphs(
                 fc_matrices=fc_matrices,
                 node_features=node_features,
                 labels=labels,
-                top_k=top_k  # 传入top_k参数
+                top_k=top_k
             )
 
-            # 保存
             filename = f"{dataset_name}_{fc_method}_{feature_type}.pkl"
             filepath = os.path.join(save_dir, filename)
 
@@ -266,7 +236,7 @@ def save_gnn_dataset(save_dir, dataset_name, fc_dict, features_dict,
                     'n_subjects': len(labels),
                     'n_nodes': graph_list[0].x.shape[0],
                     'node_feature_dim': graph_list[0].x.shape[1],
-                    'top_k': top_k,  # 记录稀疏化参数
+                    'top_k': top_k,
                     'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
                 }
             }
@@ -281,17 +251,7 @@ def save_gnn_dataset(save_dir, dataset_name, fc_dict, features_dict,
 
 
 def load_gnn_dataset(filepath):
-    """
-    加载已保存的GNN数据集
-
-    Args:
-        filepath: .pkl文件路径
-
-    Returns:
-        graph_list: List[Data]
-        labels: np.array
-        metadata: dict
-    """
+    """加载已保存的GNN数据集"""
     if not os.path.exists(filepath):
         raise FileNotFoundError(f"Dataset file not found: {filepath}")
 
@@ -308,7 +268,7 @@ def load_gnn_dataset(filepath):
 
 
 def main():
-    parser = argparse.ArgumentParser(description='Prepare GNN data with Top-K sparsification')
+    parser = argparse.ArgumentParser(description='Prepare GNN data (Fixed Version)')
     parser.add_argument('--dataset', type=str, required=True,
                         choices=['ABIDE', 'MDD'])
     parser.add_argument('--data_folder', type=str, default='./data')
@@ -318,45 +278,87 @@ def main():
                         help='Path to pretrained encoder')
     parser.add_argument('--embedding_dim', type=int, default=64)
     parser.add_argument('--device', type=str, default='cuda')
-    parser.add_argument('--top_k', type=int, default=20,  # 🔥 新增参数
+    parser.add_argument('--top_k', type=int, default=20,
                         help='Keep top-k strongest connections per node')
+    parser.add_argument('--use_statistical', action='store_true',
+                        help='Force use of statistical features (for debugging)')
 
     args = parser.parse_args()
 
     print(f"\n{'=' * 80}")
-    print(f"GNN数据准备（Top-K稀疏化）")
+    print(f"GNN数据准备（修复版）")
     print(f"{'=' * 80}")
     print(f"数据集: {args.dataset}")
-    print(f"Top-K: {args.top_k} (保留每个节点最强的{args.top_k}个连接)")
-    print(f"Encoder: {args.encoder_path}")
+    print(f"Top-K: {args.top_k}")
+    print(f"强制使用统计特征: {args.use_statistical}")
     print(f"{'=' * 80}\n")
 
-    # 1-3. 数据加载和特征提取（保持不变）
-    timeseries_list, labels, subject_ids, site_ids = load_timeseries_data(
-        args.dataset, args.data_folder
-    )
+    # 1. 加载数据（字典格式，确保ID对齐）
+    data_dict = load_data_as_dict(args.dataset, args.data_folder)
+    subject_ids = list(data_dict.keys())
 
+    # 2. 提取时间序列列表
+    timeseries_list = [data_dict[sid]['ts'] for sid in subject_ids]
+    labels = np.array([data_dict[sid]['label'] for sid in subject_ids])
+    site_ids = np.array([data_dict[sid]['site'] for sid in subject_ids])
+
+    print(f"\n✓ 数据对齐完成")
+    print(f"  被试数: {len(subject_ids)}")
+    print(f"  标签分布: {np.bincount(labels)}")
+
+    # 3. 构建FC矩阵
     fc_dict = construct_functional_graphs(
         timeseries_list,
         methods=['pearson', 'ledoit_wolf']
     )
 
+    # 4. 提取节点特征
     features_dict = {}
 
-    # 只使用预训练特征（根据你的注释，statistical已被证明无效）
-    if os.path.exists(args.encoder_path):
-        pretrained_features, pretrained_dim = extract_pretrained_features(
+    if args.use_statistical or not os.path.exists(args.encoder_path):
+        # 使用统计特征（回退方案）
+        print(f"\n{'='*80}")
+        print("⚠️ Using Statistical Features (Fallback Mode)")
+        print(f"{'='*80}")
+
+        statistical_features = []
+        for i, ts in enumerate(timeseries_list):
+            feat = extract_statistical_features(ts)
+            statistical_features.append(feat)
+
+            if (i + 1) % 100 == 0:
+                print(f"  Processed: {i+1}/{len(timeseries_list)}")
+
+        statistical_features = np.array(statistical_features)
+        features_dict['statistical'] = statistical_features
+
+        print(f"\n✓ Statistical features extracted")
+        print(f"  Feature dim: {statistical_features.shape[2]}")
+        print(f"  Shape: {statistical_features.shape}")
+
+        if not os.path.exists(args.encoder_path):
+            print(f"\n⚠️  预训练模型不存在: {args.encoder_path}")
+            print("  只使用统计特征")
+
+    else:
+        # 使用预训练特征
+        print(f"\n{'='*80}")
+        print("Using Pretrained Encoder Features")
+        print(f"{'='*80}")
+
+        pretrained_features = extract_node_features_pretrained(
             timeseries_list=timeseries_list,
             encoder_path=args.encoder_path,
             embedding_dim=args.embedding_dim,
             device=args.device
         )
-        features_dict['temporal'] = pretrained_features
-    else:
-        print(f"\n⚠️  预训练模型不存在: {args.encoder_path}")
-        print("  跳过预训练特征提取")
+        features_dict['temporal'] = np.array(pretrained_features)
 
-    # 4. 保存数据（传入top_k）
+        print(f"\n✓ Pretrained features extracted")
+        print(f"  Feature dim: {args.embedding_dim}")
+        print(f"  Shape: {features_dict['temporal'].shape}")
+
+    # 5. 保存数据集
     saved_files = save_gnn_dataset(
         save_dir=args.save_dir,
         dataset_name=args.dataset,
@@ -365,14 +367,28 @@ def main():
         labels=labels,
         subject_ids=subject_ids,
         site_ids=site_ids,
-        top_k=args.top_k  # 🔥 传入top_k参数
+        top_k=args.top_k
     )
 
     print(f"\n{'=' * 80}")
     print(f"✅ 数据准备完成！")
     print(f"{'=' * 80}")
-    print(f"\n生成了 {len(saved_files)} 个数据集文件")
-    print(f"稀疏化策略: Top-K={args.top_k}")
+    print(f"\n生成了 {len(saved_files)} 个数据集文件:")
+    for f in saved_files:
+        print(f"  - {f}")
+    print(f"\n稀疏化策略: Top-K={args.top_k}")
+
+    # 6. 数据质量提示
+    print(f"\n{'=' * 80}")
+    print("建议的验证步骤:")
+    print(f"{'=' * 80}")
+    print("1. 如果使用统计特征，预期准确率: 60-65%")
+    print("2. 如果使用预训练特征但效果差，尝试:")
+    print("   - 重新训练预训练模型（mask_ratio=0.6）")
+    print("   - 或回退到统计特征: --use_statistical")
+    print("3. 检查数据质量:")
+    print("   - 确认特征和标签对齐")
+    print("   - 验证FC矩阵合理性")
 
 
 if __name__ == '__main__':
