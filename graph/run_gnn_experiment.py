@@ -1,9 +1,9 @@
 """
-GNN实验脚本
+GNN实验脚本 - 混合特征版
 目标：验证功能图和节点特征的组合
 - FC methods: Pearson vs LedoitWolf
-- Node features: Statistical vs Temporal
-- Models: Linear, MLP, GNN
+- Node features: Hybrid (Deep + Statistical)
+- Models: Linear, GNN
 """
 
 import os
@@ -262,7 +262,7 @@ def run_experiment(data_folder='./data/gnn_datasets',
     logger, timestamp = setup_logger(save_dir)
 
     logger.info(f"\n{'=' * 80}")
-    logger.info(f"GNN EXPERIMENT: Functional Graph & Node Features")
+    logger.info(f"GNN EXPERIMENT: Hybrid Features (Deep + Statistical)")
     logger.info(f"{'=' * 80}")
     logger.info(f"Dataset: {dataset}")
     logger.info(f"Device: {device}")
@@ -271,17 +271,33 @@ def run_experiment(data_folder='./data/gnn_datasets',
 
     # 实验配置
     fc_methods = ['pearson', 'ledoit_wolf']
-    feature_types = ['statistical', 'temporal']
-    # feature_types = ['statistical']
-    # # feature_types = [ 'temporal']
+    feature_types = ['hybrid']  # 🔥 使用混合特征
 
     model_configs = [
         {'name': 'Linear', 'model_type': 'linear', 'pooling': 'flatten'},
-        # {'name': 'MLP', 'model_type': 'mlp', 'hidden_dim': 128, 'pooling': 'flatten'},
+        {'name': 'MLP', 'model_type': 'mlp', 'hidden_dim': 128, 'pooling': 'flatten'},
         {'name': 'GCN', 'model_type': 'gnn', 'gnn_type': 'gcn', 'hidden_dim': 64,
          'num_layers': 2, 'pooling': 'flatten'},
-        # {'name': 'GAT', 'model_type': 'gnn', 'gnn_type': 'gat', 'hidden_dim': 64,
-        #  'num_layers': 2, 'pooling': 'flatten'},
+        {'name': 'GAT', 'model_type': 'gnn', 'gnn_type': 'gat', 'hidden_dim': 64,
+         'num_layers': 2, 'pooling': 'flatten'},
+        {'name': 'Linear', 'model_type': 'linear', 'pooling': 'mean'},
+        {'name': 'MLP', 'model_type': 'mlp', 'hidden_dim': 128, 'pooling': 'mean'},
+        {'name': 'GCN', 'model_type': 'gnn', 'gnn_type': 'gcn', 'hidden_dim': 64,
+         'num_layers': 2, 'pooling': 'mean'},
+        {'name': 'GAT', 'model_type': 'gnn', 'gnn_type': 'gat', 'hidden_dim': 64,
+         'num_layers': 2, 'pooling': 'mean'},
+        {'name': 'Linear', 'model_type': 'linear', 'pooling': 'max'},
+        {'name': 'MLP', 'model_type': 'mlp', 'hidden_dim': 128, 'pooling': 'max'},
+        {'name': 'GCN', 'model_type': 'gnn', 'gnn_type': 'gcn', 'hidden_dim': 64,
+         'num_layers': 2, 'pooling': 'max'},
+        {'name': 'GAT', 'model_type': 'gnn', 'gnn_type': 'gat', 'hidden_dim': 64,
+         'num_layers': 2, 'pooling': 'max'},
+        {'name': 'Linear', 'model_type': 'linear', 'pooling': 'mean_max'},
+        {'name': 'MLP', 'model_type': 'mlp', 'hidden_dim': 128, 'pooling': 'mean_max'},
+        {'name': 'GCN', 'model_type': 'gnn', 'gnn_type': 'gcn', 'hidden_dim': 64,
+         'num_layers': 2, 'pooling': 'mean_max'},
+        {'name': 'GAT', 'model_type': 'gnn', 'gnn_type': 'gat', 'hidden_dim': 64,
+         'num_layers': 2, 'pooling': 'mean_max'},
     ]
 
     all_results = []
@@ -372,13 +388,14 @@ def print_best_results(df_results, logger):
     # 按balanced_accuracy排序
     df_sorted = df_results.sort_values('balanced_accuracy_mean', ascending=False)
 
-    logger.info("Top 5 configurations:")
+    logger.info("Top configurations:")
     for i, row in df_sorted.head(5).iterrows():
         logger.info(f"\n{i + 1}. {row['fc_method']} + {row['feature_type']} + {row['model']}")
         logger.info(f"   Balanced Acc: {row['balanced_accuracy_mean']:.4f} ± "
                     f"{row['balanced_accuracy_std']:.4f}")
         logger.info(f"   AUC: {row['auc_mean']:.4f} ± {row['auc_std']:.4f}")
         logger.info(f"   F1: {row['f1_mean']:.4f} ± {row['f1_std']:.4f}")
+        logger.info(f"   Feature Dim: {row['node_feature_dim']}")
 
     # 比较不同因素的影响
     logger.info(f"\n{'=' * 60}")
@@ -391,12 +408,6 @@ def print_best_results(df_results, logger):
         mean_acc = df_results[df_results['fc_method'] == fc]['balanced_accuracy_mean'].mean()
         logger.info(f"  {fc}: {mean_acc:.4f}")
 
-    # Feature type比较
-    logger.info("\nFeature Type comparison:")
-    for feat in df_results['feature_type'].unique():
-        mean_acc = df_results[df_results['feature_type'] == feat]['balanced_accuracy_mean'].mean()
-        logger.info(f"  {feat}: {mean_acc:.4f}")
-
     # Model比较
     logger.info("\nModel comparison:")
     for model in df_results['model'].unique():
@@ -407,7 +418,7 @@ def print_best_results(df_results, logger):
 
 
 def main():
-    parser = argparse.ArgumentParser(description='Run GNN experiments')
+    parser = argparse.ArgumentParser(description='Run GNN experiments with hybrid features')
 
     parser.add_argument('--dataset', type=str, default='ABIDE',
                         choices=['ABIDE', 'MDD'],

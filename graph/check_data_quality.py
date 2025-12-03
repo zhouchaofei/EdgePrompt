@@ -10,7 +10,7 @@ import os
 
 def check_data():
     # 路径指向你 run_gnn_experiment 用的那个文件
-    data_path = './data/ABIDE/gnn_datasets/ABIDE_pearson_temporal.pkl'
+    data_path = './data/REST-meta-MDD/gnn_datasets/MDD_pearson_hybrid.pkl'
 
     if not os.path.exists(data_path):
         print(f"❌ 文件不存在: {data_path}")

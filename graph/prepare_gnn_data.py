@@ -1,8 +1,8 @@
 """
-GNN数据准备 - 终极修复版
+GNN数据准备 - 混合特征版
 主要修改：
 1. 强制ID对齐，防止特征-标签错位
-2. 支持统计特征回退（Statistical Fallback）
+2. 默认使用混合特征策略（Deep + Statistical）
 3. 增强数据质量检查
 """
 
@@ -16,32 +16,6 @@ import argparse
 
 from fc_construction import FCConstructor
 from extract_node_features import extract_node_features_pretrained
-
-
-def extract_statistical_features(timeseries):
-    """
-    提取鲁棒的统计特征
-
-    Args:
-        timeseries: [T, N_ROI] 时间序列
-
-    Returns:
-        features: [N_ROI, feature_dim] 统计特征
-    """
-    T, N_ROI = timeseries.shape
-
-    # 1. 基础统计量 (Mean, Std)
-    mean = np.mean(timeseries, axis=0)  # [N_ROI]
-    std = np.std(timeseries, axis=0)    # [N_ROI]
-
-    # 2. FC Profile (每个节点与其他节点的连接强度分布)
-    fc = np.corrcoef(timeseries.T)      # [N_ROI, N_ROI]
-    np.fill_diagonal(fc, 0)
-
-    # 拼接特征: [Mean(1), Std(1), FC(N_ROI)] = (2 + N_ROI) dim
-    features = np.column_stack([mean, std, fc])
-
-    return features
 
 
 def load_data_as_dict(dataset_name, data_folder='./data'):
@@ -86,7 +60,7 @@ def load_data_as_dict(dataset_name, data_folder='./data'):
 
 
 def construct_functional_graphs(timeseries_list, methods=['pearson', 'ledoit_wolf']):
-    """构建功能连接图（保持原有逻辑）"""
+    """构建功能连接图"""
     print(f"\n{'='*80}")
     print(f"Constructing functional connectivity graphs...")
     print(f"{'='*80}")
@@ -268,7 +242,7 @@ def load_gnn_dataset(filepath):
 
 
 def main():
-    parser = argparse.ArgumentParser(description='Prepare GNN data (Fixed Version)')
+    parser = argparse.ArgumentParser(description='Prepare GNN data (Hybrid Features)')
     parser.add_argument('--dataset', type=str, required=True,
                         choices=['ABIDE', 'MDD'])
     parser.add_argument('--data_folder', type=str, default='./data')
@@ -280,17 +254,15 @@ def main():
     parser.add_argument('--device', type=str, default='cuda')
     parser.add_argument('--top_k', type=int, default=20,
                         help='Keep top-k strongest connections per node')
-    parser.add_argument('--use_statistical', action='store_true',
-                        help='Force use of statistical features (for debugging)')
 
     args = parser.parse_args()
 
     print(f"\n{'=' * 80}")
-    print(f"GNN数据准备（修复版）")
+    print(f"GNN数据准备（混合特征版）")
     print(f"{'=' * 80}")
     print(f"数据集: {args.dataset}")
     print(f"Top-K: {args.top_k}")
-    print(f"强制使用统计特征: {args.use_statistical}")
+    print(f"特征策略: Hybrid (Deep + Statistical)")
     print(f"{'=' * 80}\n")
 
     # 1. 加载数据（字典格式，确保ID对齐）
@@ -312,51 +284,25 @@ def main():
         methods=['pearson', 'ledoit_wolf']
     )
 
-    # 4. 提取节点特征
-    features_dict = {}
+    # 4. 提取节点特征（直接调用混合提取）
+    print(f"\n{'='*80}")
+    print("Using Hybrid Feature Extraction (Deep + Statistical)")
+    print(f"{'='*80}")
 
-    if args.use_statistical or not os.path.exists(args.encoder_path):
-        # 使用统计特征（回退方案）
-        print(f"\n{'='*80}")
-        print("⚠️ Using Statistical Features (Fallback Mode)")
-        print(f"{'='*80}")
+    # 无论如何都调用 extract_node_features_pretrained
+    # 内部会自动判断：如果模型不存在，自动fallback到统计特征
+    features_list = extract_node_features_pretrained(
+        timeseries_list=timeseries_list,
+        encoder_path=args.encoder_path,
+        embedding_dim=args.embedding_dim,
+        device=args.device
+    )
 
-        statistical_features = []
-        for i, ts in enumerate(timeseries_list):
-            feat = extract_statistical_features(ts)
-            statistical_features.append(feat)
+    # 注意：feature_type 名字变为 'hybrid'
+    features_dict = {'hybrid': np.array(features_list)}
 
-            if (i + 1) % 100 == 0:
-                print(f"  Processed: {i+1}/{len(timeseries_list)}")
-
-        statistical_features = np.array(statistical_features)
-        features_dict['statistical'] = statistical_features
-
-        print(f"\n✓ Statistical features extracted")
-        print(f"  Feature dim: {statistical_features.shape[2]}")
-        print(f"  Shape: {statistical_features.shape}")
-
-        if not os.path.exists(args.encoder_path):
-            print(f"\n⚠️  预训练模型不存在: {args.encoder_path}")
-            print("  只使用统计特征")
-
-    else:
-        # 使用预训练特征
-        print(f"\n{'='*80}")
-        print("Using Pretrained Encoder Features")
-        print(f"{'='*80}")
-
-        pretrained_features = extract_node_features_pretrained(
-            timeseries_list=timeseries_list,
-            encoder_path=args.encoder_path,
-            embedding_dim=args.embedding_dim,
-            device=args.device
-        )
-        features_dict['temporal'] = np.array(pretrained_features)
-
-        print(f"\n✓ Pretrained features extracted")
-        print(f"  Feature dim: {args.embedding_dim}")
-        print(f"  Shape: {features_dict['temporal'].shape}")
+    print(f"\n✓ 混合特征提取完成")
+    print(f"  Feature shape: {features_dict['hybrid'].shape}")
 
     # 5. 保存数据集
     saved_files = save_gnn_dataset(
@@ -378,17 +324,19 @@ def main():
         print(f"  - {f}")
     print(f"\n稀疏化策略: Top-K={args.top_k}")
 
-    # 6. 数据质量提示
+    # 6. 预期结果提示
     print(f"\n{'=' * 80}")
-    print("建议的验证步骤:")
+    print("预期结果:")
     print(f"{'=' * 80}")
-    print("1. 如果使用统计特征，预期准确率: 60-65%")
-    print("2. 如果使用预训练特征但效果差，尝试:")
-    print("   - 重新训练预训练模型（mask_ratio=0.6）")
-    print("   - 或回退到统计特征: --use_statistical")
-    print("3. 检查数据质量:")
-    print("   - 确认特征和标签对齐")
-    print("   - 验证FC矩阵合理性")
+    print("1. 如果预训练模型加载成功:")
+    print("   - 混合特征 = Deep(192维) + Statistical(116维) = 308维")
+    print("   - 预期准确率: 62-66% (统计特征保底 + 深度特征提升)")
+    print("2. 如果预训练模型加载失败:")
+    print("   - 自动回退到统计特征 (116维)")
+    print("   - 预期准确率: 60-63%")
+    print("3. 建议验证步骤:")
+    print("   - 运行 check_data_quality.py 验证数据质量")
+    print("   - 运行 run_gnn_experiment.py 测试性能")
 
 
 if __name__ == '__main__':
