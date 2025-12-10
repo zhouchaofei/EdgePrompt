@@ -5,84 +5,11 @@ from sparse_softmax import Sparsemax
 from torch.nn import Parameter
 from torch_geometric.data import Data
 from torch_geometric.nn.conv import MessagePassing
-# 移除报错的导入行：from torch_geometric.nn.pool.topk_pool import topk, filter_adj
+from torch_geometric.nn.pool.topk_pool import topk, filter_adj
 from torch_geometric.utils import softmax, dense_to_sparse, add_remaining_self_loops
 from torch_scatter import scatter_add
 from torch_sparse import spspmm, coalesce
 
-
-# =============================================================================
-# 手动实现 topk 和 filter_adj 以兼容新版 PyG
-# =============================================================================
-
-def topk(x, ratio, batch, min_score=None, tol=1e-7):
-    """
-    手动实现的 TopK 选择逻辑
-    """
-    if min_score is not None:
-        # 简单处理：如果设置了 min_score，这里暂时忽略，
-        # 因为 HGPSL 主要依赖 ratio。如果需要完整功能需额外引入 scatter_max
-        pass
-
-    num_nodes = scatter_add(batch.new_ones(x.size(0)), batch, dim=0)
-    batch_size, max_num_nodes = num_nodes.size(0), num_nodes.max().item()
-
-    cum_num_nodes = torch.cat(
-        [num_nodes.new_zeros(1),
-         num_nodes.cumsum(dim=0)[:-1]], dim=0)
-
-    # 计算全局索引对应的局部索引
-    index = torch.arange(batch.size(0), dtype=torch.long, device=x.device)
-    index = (index - cum_num_nodes[batch]) + (batch * max_num_nodes)
-
-    # 创建密集矩阵进行排序
-    dense_x = x.new_full((batch_size * max_num_nodes,), -1e38)
-    dense_x[index] = x
-    dense_x = dense_x.view(batch_size, max_num_nodes)
-
-    _, perm = dense_x.sort(dim=-1, descending=True)
-
-    perm = perm + cum_num_nodes.view(-1, 1)
-    perm = perm.view(-1)
-
-    k = (ratio * num_nodes.to(torch.float)).ceil().to(torch.long)
-    mask = [
-        torch.arange(k[i], dtype=torch.long, device=x.device) +
-        i * max_num_nodes for i in range(batch_size)
-    ]
-    mask = torch.cat(mask, dim=0)
-
-    perm = perm[mask]
-
-    return perm
-
-
-def filter_adj(edge_index, edge_attr, perm, num_nodes=None):
-    """
-    手动实现的边过滤逻辑：保留 perm 中的节点之间的边，并重映射索引
-    """
-    num_nodes = perm.size(0) if num_nodes is None else num_nodes
-    mask = perm.new_full((num_nodes,), -1, dtype=torch.long)
-
-    # 将保留的节点索引映射到 0 到 len(perm)-1
-    mask[perm] = torch.arange(perm.size(0), dtype=torch.long, device=perm.device)
-
-    row, col = edge_index
-    row, col = mask[row], mask[col]
-
-    # 过滤掉连接到被删除节点的边
-    mask = (row >= 0) & (col >= 0)
-    row, col = row[mask], col[mask]
-
-    if edge_attr is not None:
-        edge_attr = edge_attr[mask]
-
-    return torch.stack([row, col], dim=0), edge_attr
-
-
-# =============================================================================
-# 原有类定义
-# =============================================================================
 
 class TwoHopNeighborhood(object):
     def __call__(self, data):
@@ -184,14 +111,9 @@ class HGPSLPool(torch.nn.Module):
 
         # Graph Pooling
         original_x = x
-
-        # 使用本地定义的 topk 函数
         perm = topk(score, self.ratio, batch)
-
         x = x[perm]
         batch = batch[perm]
-
-        # 使用本地定义的 filter_adj 函数
         induced_edge_index, induced_edge_attr = filter_adj(edge_index, edge_attr, perm, num_nodes=score.size(0))
 
         # Discard structure learning layer, directly return
@@ -201,6 +123,9 @@ class HGPSLPool(torch.nn.Module):
         # Structure Learning
         if self.sample:
             # A fast mode for large graphs.
+            # In large graphs, learning the possible edge weights between each pair of nodes is time consuming.
+            # To accelerate this process, we sample it's K-Hop neighbors for each node and then learn the
+            # edge weights between them.
             k_hop = 3
             if edge_attr is None:
                 edge_attr = torch.ones((edge_index.size(1),), dtype=torch.float, device=edge_index.device)
@@ -210,8 +135,6 @@ class HGPSLPool(torch.nn.Module):
                 hop_data = self.neighbor_augment(hop_data)
             hop_edge_index = hop_data.edge_index
             hop_edge_attr = hop_data.edge_attr
-
-            # 使用本地定义的 filter_adj 函数
             new_edge_index, new_edge_attr = filter_adj(hop_edge_index, hop_edge_attr, perm, num_nodes=score.size(0))
 
             new_edge_index, new_edge_attr = add_remaining_self_loops(new_edge_index, new_edge_attr, 0, x.size(0))
@@ -233,7 +156,7 @@ class HGPSLPool(torch.nn.Module):
             del adj
             torch.cuda.empty_cache()
         else:
-            # Learning the possible edge weights between each pair of nodes in the pooled subgraph
+            # Learning the possible edge weights between each pair of nodes in the pooled subgraph, relative slower.
             if edge_attr is None:
                 induced_edge_attr = torch.ones((induced_edge_index.size(1),), dtype=x.dtype,
                                                device=induced_edge_index.device)
