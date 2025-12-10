@@ -133,9 +133,9 @@ class DualBranchGNN(nn.Module):
         x = F.dropout(x, p=self.dropout, training=self.training)
 
         # 3. HGPSL Pooling
-        # 如果没有edge_attr，创建全1向量
+        # 如果没有edge_attr，创建全1向量（注意：必须是1维的）
         if edge_attr is None:
-            edge_attr = x.new_ones((edge_index.size(1), 1))
+            edge_attr = x.new_ones(edge_index.size(1))
 
         x, edge_index, edge_attr, batch = self.struct_pool(
             x, edge_index, edge_attr, batch
@@ -234,9 +234,22 @@ class DualBranchGNN(nn.Module):
         x_func = x[roi_mask]
         batch_func = batch[roi_mask]
 
+        # 创建节点索引映射：从原始索引到新索引
+        # old_to_new[i] = j 表示原始节点i在过滤后变成节点j
+        num_nodes = x.size(0)
+        old_to_new = torch.full((num_nodes,), -1, dtype=torch.long, device=x.device)
+        old_to_new[roi_mask] = torch.arange(roi_mask.sum(), dtype=torch.long, device=x.device)
+
+        # 重新映射边索引
+        edge_index_func_remapped = old_to_new[data.edge_index_func]
+
+        # 过滤掉任何无效的边（-1表示节点被过滤掉了）
+        valid_edges = (edge_index_func_remapped[0] >= 0) & (edge_index_func_remapped[1] >= 0)
+        edge_index_func_remapped = edge_index_func_remapped[:, valid_edges]
+
         z_func = self.forward_func_branch(
             x=x_func,
-            edge_index=data.edge_index_func,
+            edge_index=edge_index_func_remapped,
             batch=batch_func
         )
 
