@@ -5,11 +5,104 @@ from sparse_softmax import Sparsemax
 from torch.nn import Parameter
 from torch_geometric.data import Data
 from torch_geometric.nn.conv import MessagePassing
-from torch_geometric.nn.pool.topk_pool import topk, filter_adj
 from torch_geometric.utils import softmax, dense_to_sparse, add_remaining_self_loops
-from torch_scatter import scatter_add
+from torch_scatter import scatter_add, scatter_max
 from torch_sparse import spspmm, coalesce
 
+
+# ============================================================
+# 兼容性函数：topk 和 filter_adj
+# 这些函数在新版本 PyTorch Geometric 中不再从 topk_pool 导出
+# ============================================================
+
+def topk(x, ratio, batch, min_score=None, tol=1e-7):
+    """
+    Top-k pooling function
+
+    Args:
+        x: Node scores
+        ratio: Pooling ratio
+        batch: Batch vector
+        min_score: Minimum score threshold (optional)
+        tol: Tolerance value
+
+    Returns:
+        perm: Indices of selected nodes
+    """
+    if min_score is not None:
+        # 确保不会删除图中的所有节点
+        scores_max = scatter_max(x, batch)[0][batch] - tol
+        scores_min = scores_max.clamp(max=min_score)
+        perm = (x > scores_min).nonzero(as_tuple=False).view(-1)
+    else:
+        num_nodes = scatter_add(batch.new_ones(x.size(0)), batch, dim=0)
+        batch_size, max_num_nodes = num_nodes.size(0), num_nodes.max().item()
+
+        cum_num_nodes = torch.cat(
+            [num_nodes.new_zeros(1), num_nodes.cumsum(dim=0)[:-1]], dim=0)
+
+        index = torch.arange(batch.size(0), dtype=torch.long, device=x.device)
+        index = (index - cum_num_nodes[batch]) + (batch * max_num_nodes)
+
+        dense_x = x.new_full((batch_size * max_num_nodes,),
+                             torch.finfo(x.dtype).min)
+        dense_x[index] = x
+        dense_x = dense_x.view(batch_size, max_num_nodes)
+
+        _, perm = dense_x.sort(dim=-1, descending=True)
+        perm = perm + cum_num_nodes.view(-1, 1)
+        perm = perm.view(-1)
+
+        k = (ratio * num_nodes.to(torch.float)).ceil().to(torch.long)
+        mask = [
+            torch.arange(k[i], dtype=torch.long, device=x.device) +
+            i * max_num_nodes for i in range(batch_size)
+        ]
+        mask = torch.cat(mask, dim=0)
+
+        perm = perm[mask]
+
+    return perm
+
+
+def filter_adj(edge_index, edge_attr, perm, num_nodes=None):
+    """
+    Filter adjacency matrix based on node permutation
+
+    Args:
+        edge_index: Edge indices [2, num_edges]
+        edge_attr: Edge attributes
+        perm: Node permutation indices
+        num_nodes: Number of nodes
+
+    Returns:
+        new_edge_index: Filtered edge indices
+        new_edge_attr: Filtered edge attributes (or None)
+    """
+    num_nodes = maybe_num_nodes(edge_index, num_nodes)
+
+    mask = perm.new_full((num_nodes,), -1)
+    i = torch.arange(perm.size(0), dtype=torch.long, device=perm.device)
+    mask[perm] = i
+
+    row, col = edge_index
+    row, col = mask[row], mask[col]
+    mask = (row >= 0) & (col >= 0)
+    row, col = row[mask], col[mask]
+
+    if edge_attr is not None:
+        edge_attr = edge_attr[mask]
+
+    return torch.stack([row, col], dim=0), edge_attr
+
+
+# 导入 maybe_num_nodes
+from torch_geometric.utils.num_nodes import maybe_num_nodes
+
+
+# ============================================================
+# 原有的类定义
+# ============================================================
 
 class TwoHopNeighborhood(object):
     def __call__(self, data):
@@ -122,10 +215,7 @@ class HGPSLPool(torch.nn.Module):
 
         # Structure Learning
         if self.sample:
-            # A fast mode for large graphs.
-            # In large graphs, learning the possible edge weights between each pair of nodes is time consuming.
-            # To accelerate this process, we sample it's K-Hop neighbors for each node and then learn the
-            # edge weights between them.
+            # A fast mode for large graphs
             k_hop = 3
             if edge_attr is None:
                 edge_attr = torch.ones((edge_index.size(1),), dtype=torch.float, device=edge_index.device)
@@ -156,7 +246,7 @@ class HGPSLPool(torch.nn.Module):
             del adj
             torch.cuda.empty_cache()
         else:
-            # Learning the possible edge weights between each pair of nodes in the pooled subgraph, relative slower.
+            # Learning the possible edge weights between each pair of nodes
             if edge_attr is None:
                 induced_edge_attr = torch.ones((induced_edge_index.size(1),), dtype=x.dtype,
                                                device=induced_edge_index.device)
@@ -164,7 +254,7 @@ class HGPSLPool(torch.nn.Module):
             shift_cum_num_nodes = torch.cat([num_nodes.new_zeros(1), num_nodes.cumsum(dim=0)[:-1]], dim=0)
             cum_num_nodes = num_nodes.cumsum(dim=0)
             adj = torch.zeros((x.size(0), x.size(0)), dtype=torch.float, device=x.device)
-            # Construct batch fully connected graph in block diagonal matirx format
+            # Construct batch fully connected graph in block diagonal matrix format
             for idx_i, idx_j in zip(shift_cum_num_nodes, cum_num_nodes):
                 adj[idx_i:idx_j, idx_i:idx_j] = 1.0
             new_edge_index, _ = dense_to_sparse(adj)
