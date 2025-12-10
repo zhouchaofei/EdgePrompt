@@ -34,17 +34,23 @@ class GIN(nn.Module):
         super(GIN, self).__init__()
         self.num_layer = num_layer
         self.drop_ratio = drop_ratio
-        self.hidden_dim = hidden_dim  # 添加：保存hidden_dim
+        self.hidden_dim = hidden_dim
 
-        if self.num_layer < 2:
-            raise ValueError("Number of GNN layers must be greater than 1.")
+        # =========================================================
+        # 修改点：移除了 < 2 的报错限制，改为 < 1
+        # 这样 DualBranchGNN 中的 struct_gin_pre (1层) 才能正常初始化
+        # =========================================================
+        if self.num_layer < 1:
+            raise ValueError("Number of GNN layers must be at least 1.")
 
         self.convs = nn.ModuleList()
         self.batch_norms = nn.ModuleList()
 
+        # 第一层
         self.convs.append(GINConv(input_dim=input_dim, hidden_dim=hidden_dim))
         self.batch_norms.append(nn.BatchNorm1d(hidden_dim))
 
+        # 后续层（如果 num_layer=1，这里的循环范围是 range(0)，不会执行，符合预期）
         for layer in range(num_layer - 1):
             self.convs.append(GINConv(input_dim=hidden_dim, hidden_dim=hidden_dim))
             self.batch_norms.append(nn.BatchNorm1d(hidden_dim))
@@ -114,26 +120,9 @@ class GIN(nn.Module):
 
         return node_emb
 
-    # ==========================================
-    # 新增方法：获取节点嵌入（用于EdgePrediction预训练）
-    # ==========================================
     def get_node_embeddings(self, data):
         """
         获取节点级嵌入（用于边预测等任务）
-
-        Args:
-            data: PyG Data对象
-                - data.x: [N, input_dim] 节点特征
-                - data.edge_index: [2, E] 边索引
-                - data.batch: [N] batch索引（可选）
-
-        Returns:
-            node_embeddings: [N, hidden_dim] 节点嵌入
-
-        使用场景：
-            - EdgePrediction预训练任务
-            - 需要节点级别表示的下游任务
-            - Link prediction等边相关任务
         """
         x, edge_index = data.x, data.edge_index
 
@@ -150,4 +139,4 @@ class GIN(nn.Module):
                 # 中间层
                 h = F.dropout(F.relu(h), self.drop_ratio, training=self.training)
 
-        return h  # [N, hidden_dim]
+        return h
